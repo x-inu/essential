@@ -1,0 +1,14 @@
+name = "essential-raw"
+main = "src/index.js"
+compatibility_date = "2025-08-01"
+
+[observability]
+enabled = true
+
+# Deploy: raw.xinu.my.id/*
+# Pastikan subdomain "raw" sudah ada di DNS Cloudflare (AAAA 100:: proxied)
+# lalu jalankan: npx wrangler deploy
+
+routes = [
+  { pattern = "raw.xinu.my.id/*", zone_name = "xinu.my.id" }
+]
