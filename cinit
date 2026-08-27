@@ -1,1 +1,34 @@
-echo 'network: {config: disabled}' | sudo tee /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+#!/usr/bin/env sh
+set -eu
+
+PAYLOAD='
+set -eu
+
+if [ ! -d /etc/cloud ]; then
+  echo "cloud-init tidak terpasang, tidak ada yang perlu dimatikan."
+  exit 0
+fi
+
+touch /etc/cloud/cloud-init.disabled
+mkdir -p /etc/cloud/cloud.cfg.d
+printf "network: {config: disabled}\n" > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+
+for u in cloud-init cloud-init-local cloud-config cloud-final; do
+  systemctl disable --now "$u".service 2>/dev/null || true
+  systemctl mask "$u".service 2>/dev/null || true
+done
+
+echo "cloud-init dimatikan. Reboot untuk memastikan."
+'
+
+if [ "$(id -u)" -eq 0 ]; then
+  exec sh -c "$PAYLOAD"
+fi
+
+if ! command -v sudo >/dev/null 2>&1; then
+  echo "Bukan root dan sudo tidak tersedia. Jalankan sebagai root." >&2
+  exit 1
+fi
+
+echo "Bukan root - meminta akses sudo..."
+exec sudo -p "[sudo] password untuk %u: " sh -c "$PAYLOAD"
