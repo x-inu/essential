@@ -19,7 +19,7 @@ const FALLBACK_NOTES = {
   cinit: {
     title: "Disable cloud-init",
     kanji: "止",
-    note: "Stops cloud-init from reclaiming your network config on the next boot. Writes the disable flag, masks the four units, pins network config off. Elevates through sudo on its own when it is not run as root.",
+    note: "Stops cloud-init from reclaiming your network config on the next boot. Writes the disable flag, masks the four units, pins network config off.",
     target: "Debian · Ubuntu · any systemd host with /etc/cloud",
   },
   sudo: {
