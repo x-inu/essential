@@ -5,9 +5,16 @@ const BRANCH = "main";
 const CACHE_TTL = 300;
 const DOMAIN = "raw.xinu.my.id";
 
-const HIDDEN = new Set(["LICENSE", "README.md", "wrangler.toml", "package.json", "package-lock.json"]);
+const HIDDEN = new Set([
+  "LICENSE",
+  "README.md",
+  "wrangler.toml",
+  "package.json",
+  "package-lock.json",
+  "meta.json",
+]);
 
-const NOTES = {
+const FALLBACK_NOTES = {
   cinit: {
     title: "Disable cloud-init",
     kanji: "止",
@@ -77,9 +84,22 @@ async function listFiles() {
   }
 }
 
+async function loadNotes() {
+  try {
+    const res = await fetch(`${GITHUB_RAW}/meta.json`, {
+      headers: { "User-Agent": `${DOMAIN} proxy` },
+    });
+    if (!res.ok) return FALLBACK_NOTES;
+    const data = await res.json();
+    return data && typeof data === "object" ? data : FALLBACK_NOTES;
+  } catch {
+    return FALLBACK_NOTES;
+  }
+}
+
 async function serveIndex() {
-  const files = await listFiles();
-  const html = render(files);
+  const [files, notes] = await Promise.all([listFiles(), loadNotes()]);
+  const html = render(files, notes);
 
   return new Response(html, {
     headers: {
@@ -89,11 +109,11 @@ async function serveIndex() {
   });
 }
 
-function render(files) {
+function render(files, notes) {
   const total = files.reduce((n, f) => n + f.size, 0);
 
   const rows = files.length
-    ? files.map((f, i) => scriptEntry(f, i)).join("")
+    ? files.map((f, i) => scriptEntry(f, i, notes)).join("")
     : `<p class="empty">No scripts published on <span class="mono">${BRANCH}</span> yet.</p>`;
 
   return `<!DOCTYPE html>
@@ -565,19 +585,23 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
         <h2 class="stmt">The repository is the deployment.</h2>
       </div>
       <div class="notes">
-        <div class="readout">GET https://${DOMAIN}/cinit
+        <div class="readout">GET https://${DOMAIN}/<span class="comment">&lt;file&gt;</span>
   <span class="comment">│</span>
   <span class="comment">├─</span> edge cache hit  <span class="comment">→ served, 0 hops</span>
   <span class="comment">└─</span> miss
-       <span class="comment">└─</span> raw.githubusercontent.com/${REPO}/${BRANCH}/cinit
+       <span class="comment">└─</span> raw.githubusercontent.com/${REPO}/${BRANCH}/<span class="comment">&lt;file&gt;</span>
             <span class="comment">└─</span> cached ${CACHE_TTL / 60} min, then served</div>
         <div class="note">
           <p class="label note__k">No deploy step</p>
-          <p>Commit to <span class="mono">${BRANCH}</span> and it is published. Nothing to rebuild, nothing to invalidate by hand.</p>
+          <p>Commit a file to <span class="mono">${BRANCH}</span> and it is published under its own name. Nothing to rebuild, nothing to register, nothing to invalidate by hand.</p>
         </div>
         <div class="note">
           <p class="label note__k">Cached at the edge</p>
           <p>A hit never touches GitHub, so rate limits stay clear and a GitHub outage does not take the cached copy down. Changes land within ${CACHE_TTL / 60} minutes.</p>
+        </div>
+        <div class="note">
+          <p class="label note__k">Describe it in meta.json</p>
+          <p>Optional. Add an entry keyed by filename and the index above picks up the title, note and target on the next fetch.</p>
         </div>
       </div>
     </div>
@@ -590,9 +614,9 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
         <span class="tick tick--tl"></span><span class="tick tick--tr"></span>
         <span class="tick tick--bl"></span><span class="tick tick--br"></span>
         <h2 class="stmt" style="margin-bottom:var(--s5)">Read it before you run it.</h2>
-        <p class="entry__note">Piping a URL into a shell hands it your machine. These scripts are mine and they are short on purpose — open the file, read the thirty-odd lines, then decide. Drop the pipe to inspect first:</p>
-        <div class="readout" style="margin-top:var(--s5)"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/cinit</span>          <span class="comment"># print it</span>
-<span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/cinit | sh</span>     <span class="comment"># then run it</span></div>
+        <p class="entry__note">Piping a URL into a shell hands it your machine. These scripts are mine and they are short on purpose — open the file, read it end to end, then decide. Drop the pipe to inspect first:</p>
+        <div class="readout" style="margin-top:var(--s5)"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/</span><span class="comment">&lt;file&gt;</span>          <span class="comment"># print it</span>
+<span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/</span><span class="comment">&lt;file&gt;</span><span class="hl"> | sh</span>     <span class="comment"># then run it</span></div>
       </div>
     </div>
   </section>
@@ -633,11 +657,11 @@ document.querySelectorAll("[data-copy]").forEach(btn => {
 </html>`;
 }
 
-function scriptEntry(file, i) {
+function scriptEntry(file, i, notes) {
   const name = esc(file.name);
-  const meta = NOTES[file.name] || {};
+  const meta = (notes && notes[file.name]) || {};
   const title = esc(meta.title || name);
-  const kanji = meta.kanji || "・";
+  const kanji = esc(meta.kanji || "・");
   const note = esc(meta.note || `Served straight from ${REPO} at ${BRANCH}.`);
   const target = meta.target ? esc(meta.target) : null;
   const cmd = `curl -fsSL https://${DOMAIN}/${name} | sh`;
