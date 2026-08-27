@@ -1,5 +1,6 @@
 const GITHUB_RAW = "https://raw.githubusercontent.com/x-inu/essential/main";
 const GITHUB_API = "https://api.github.com/repos/x-inu/essential/git/trees/main";
+const JSDELIVR_API = "https://data.jsdelivr.com/v1/packages/gh/x-inu/essential@main?structure=flat";
 const REPO = "x-inu/essential";
 const BRANCH = "main";
 const CACHE_TTL = 300;
@@ -20,6 +21,12 @@ const FALLBACK_NOTES = {
     kanji: "止",
     note: "Stops cloud-init from reclaiming your network config on the next boot. Writes the disable flag, masks the four units, pins network config off. Elevates through sudo on its own when it is not run as root.",
     target: "Debian · Ubuntu · any systemd host with /etc/cloud",
+  },
+  sudo: {
+    title: "Install sudo",
+    kanji: "権",
+    note: "Installs sudo on a minimal box and puts your account in the admin group. Must be started as root: sudo is the thing that is missing.",
+    target: "Debian · Ubuntu · Fedora · Arch · Alpine",
   },
 };
 
@@ -63,22 +70,43 @@ export default {
   },
 };
 
+function keep(name) {
+  return !name.includes("/") && !name.startsWith(".") && !HIDDEN.has(name);
+}
+
 async function listFiles() {
+  const viaGitHub = await listViaGitHub();
+  if (viaGitHub.length) return viaGitHub;
+  return listViaJsdelivr();
+}
+
+async function listViaGitHub() {
   try {
     const res = await fetch(`${GITHUB_API}?recursive=1`, {
       headers: { "User-Agent": `${DOMAIN} proxy` },
     });
     if (!res.ok) return [];
     const data = await res.json();
+    if (!data || !Array.isArray(data.tree)) return [];
     return data.tree
-      .filter(
-        f =>
-          f.type === "blob" &&
-          !f.path.includes("/") &&
-          !f.path.startsWith(".") &&
-          !HIDDEN.has(f.path)
-      )
+      .filter(f => f.type === "blob" && keep(f.path))
       .map(f => ({ name: f.path, size: f.size }));
+  } catch {
+    return [];
+  }
+}
+
+async function listViaJsdelivr() {
+  try {
+    const res = await fetch(JSDELIVR_API, {
+      headers: { "User-Agent": `${DOMAIN} proxy` },
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!data || !Array.isArray(data.files)) return [];
+    return data.files
+      .map(f => ({ name: String(f.name || "").replace(/^\//, ""), size: f.size }))
+      .filter(f => f.name && keep(f.name));
   } catch {
     return [];
   }
@@ -99,6 +127,7 @@ async function loadNotes() {
 
 async function serveIndex() {
   const [files, notes] = await Promise.all([listFiles(), loadNotes()]);
+  files.sort((a, b) => a.name.localeCompare(b.name));
   const html = render(files, notes);
 
   return new Response(html, {
