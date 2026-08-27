@@ -5,7 +5,7 @@ PAYLOAD='
 set -eu
 
 if [ ! -d /etc/cloud ]; then
-  echo "cloud-init tidak terpasang, tidak ada yang perlu dimatikan."
+  echo "cloud-init is not installed, nothing to disable."
   exit 0
 fi
 
@@ -18,7 +18,7 @@ for u in cloud-init cloud-init-local cloud-config cloud-final; do
   systemctl mask "$u".service 2>/dev/null || true
 done
 
-echo "cloud-init dimatikan. Reboot untuk memastikan."
+echo "cloud-init disabled. Reboot to confirm."
 '
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -26,9 +26,9 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 if ! command -v sudo >/dev/null 2>&1; then
-  echo "Bukan root dan sudo tidak tersedia. Jalankan sebagai root." >&2
+  echo "Not root and sudo is unavailable. Run this as root." >&2
   exit 1
 fi
 
-echo "Bukan root - meminta akses sudo..."
-exec sudo -p "[sudo] password untuk %u: " sh -c "$PAYLOAD"
+echo "Not root - requesting sudo access..."
+exec sudo -p "[sudo] password for %u: " sh -c "$PAYLOAD"
