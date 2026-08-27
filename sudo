@@ -1,0 +1,117 @@
+#!/usr/bin/env sh
+set -eu
+
+# Installs sudo and grants an existing user administrative rights.
+#
+#   su -c "sh -c \"\$(curl -fsSL https://raw.xinu.my.id/sudo)\""
+#   su -c "sh -c \"\$(curl -fsSL https://raw.xinu.my.id/sudo)\" -- alice"
+#
+# This script cannot elevate itself: on a fresh Debian install sudo is the
+# thing that is missing, so it has to be started as root.
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "This must run as root. sudo is what we are about to install, so:" >&2
+  echo "  su -c \"sh -c \\\"\\\$(curl -fsSL https://raw.xinu.my.id/sudo)\\\"\"" >&2
+  exit 1
+fi
+
+# --- pick the user to promote -------------------------------------------------
+
+TARGET="${1:-${TARGET_USER:-}}"
+
+if [ -z "$TARGET" ]; then
+  TARGET="$(logname 2>/dev/null || true)"
+  [ "$TARGET" = "root" ] && TARGET=""
+fi
+
+if [ -z "$TARGET" ]; then
+  CANDIDATES="$(awk -F: '$3 >= 1000 && $3 < 65534 && $1 != "nobody" { print $1 }' /etc/passwd)"
+  COUNT="$(printf '%s\n' "$CANDIDATES" | grep -c . || true)"
+  if [ "$COUNT" = "1" ]; then
+    TARGET="$CANDIDATES"
+  elif [ "$COUNT" = "0" ]; then
+    echo "No regular user account exists yet. Create one first:" >&2
+    echo "  adduser alice" >&2
+    exit 1
+  else
+    echo "Several user accounts exist, so pick one explicitly:" >&2
+    printf '%s\n' "$CANDIDATES" | sed 's/^/  /' >&2
+    echo "Then rerun with the name appended:" >&2
+    echo "  su -c \"sh -c \\\"\\\$(curl -fsSL https://raw.xinu.my.id/sudo)\\\" -- alice\"" >&2
+    exit 1
+  fi
+fi
+
+if ! id "$TARGET" >/dev/null 2>&1; then
+  echo "User '$TARGET' does not exist. Create it first: adduser $TARGET" >&2
+  exit 1
+fi
+
+if [ "$(id -u "$TARGET")" -eq 0 ]; then
+  echo "'$TARGET' is already root and does not need sudo." >&2
+  exit 1
+fi
+
+echo "Target user: $TARGET"
+
+# --- install sudo ------------------------------------------------------------
+
+if command -v sudo >/dev/null 2>&1; then
+  echo "sudo is already installed, skipping the install step."
+elif command -v apt-get >/dev/null 2>&1; then
+  echo "Installing sudo with apt-get..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq sudo
+elif command -v dnf >/dev/null 2>&1; then
+  echo "Installing sudo with dnf..."
+  dnf install -y -q sudo
+elif command -v pacman >/dev/null 2>&1; then
+  echo "Installing sudo with pacman..."
+  pacman -Sy --noconfirm --needed sudo
+elif command -v apk >/dev/null 2>&1; then
+  echo "Installing sudo with apk..."
+  apk add --quiet sudo
+else
+  echo "No supported package manager found (apt-get, dnf, pacman, apk)." >&2
+  exit 1
+fi
+
+command -v sudo >/dev/null 2>&1 || { echo "sudo is still missing after the install." >&2; exit 1; }
+
+# --- grant administrative rights ---------------------------------------------
+
+if getent group sudo >/dev/null 2>&1; then
+  ADMIN_GROUP=sudo
+elif getent group wheel >/dev/null 2>&1; then
+  ADMIN_GROUP=wheel
+else
+  ADMIN_GROUP=sudo
+  groupadd "$ADMIN_GROUP"
+fi
+
+if id -nG "$TARGET" | tr ' ' '\n' | grep -qx "$ADMIN_GROUP"; then
+  echo "'$TARGET' is already in the '$ADMIN_GROUP' group."
+else
+  usermod -aG "$ADMIN_GROUP" "$TARGET"
+  echo "Added '$TARGET' to the '$ADMIN_GROUP' group."
+fi
+
+# On some minimal images the group line is present but commented out.
+if [ -f /etc/sudoers ] && ! grep -qE "^%${ADMIN_GROUP}[[:space:]]" /etc/sudoers; then
+  printf '%%%s ALL=(ALL:ALL) ALL\n' "$ADMIN_GROUP" > "/etc/sudoers.d/90-${ADMIN_GROUP}"
+  chmod 0440 "/etc/sudoers.d/90-${ADMIN_GROUP}"
+  echo "Granted the '$ADMIN_GROUP' group full rights via /etc/sudoers.d/90-${ADMIN_GROUP}."
+fi
+
+# --- verify ------------------------------------------------------------------
+
+if command -v visudo >/dev/null 2>&1 && ! visudo -c >/dev/null 2>&1; then
+  echo "Warning: visudo reports the sudoers configuration is not valid." >&2
+  exit 1
+fi
+
+echo
+echo "Done. sudo $(sudo --version 2>/dev/null | head -1 | awk '{print $NF}') is installed."
+echo "Log out and back in so '$TARGET' picks up the new group, then check:"
+echo "  sudo -v"
