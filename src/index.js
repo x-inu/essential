@@ -111,6 +111,7 @@ async function serveIndex() {
 
 function render(files, notes) {
   const total = files.reduce((n, f) => n + f.size, 0);
+  const sample = files.length ? esc(files[0].name) : "cinit";
 
   const rows = files.length
     ? files.map((f, i) => scriptEntry(f, i, notes)).join("")
@@ -615,8 +616,8 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
         <span class="tick tick--bl"></span><span class="tick tick--br"></span>
         <h2 class="stmt" style="margin-bottom:var(--s5)">Read it before you run it.</h2>
         <p class="entry__note">Piping a URL into a shell hands it your machine. These scripts are mine and they are short on purpose — open the file, read it end to end, then decide. Drop the pipe to inspect first:</p>
-        <div class="readout" style="margin-top:var(--s5)"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/</span><span class="comment">&lt;file&gt;</span>          <span class="comment"># print it</span>
-<span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/</span><span class="comment">&lt;file&gt;</span><span class="hl"> | sh</span>     <span class="comment"># then run it</span></div>
+        <div class="readout" style="margin-top:var(--s5)"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/${sample}</span>${" ".repeat(10)}<span class="comment"># print it</span>
+<span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/${sample} | sh</span>${" ".repeat(5)}<span class="comment"># then run it</span></div>
       </div>
     </div>
   </section>
