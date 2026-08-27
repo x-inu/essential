@@ -160,7 +160,7 @@ function render(files, notes) {
   const names = files.length ? files.map(f => f.name) : ["cinit"];
   const sample = esc(names[0]);
   const sampleWidth = Math.max(...names.map(n => n.length));
-  const rotate = `<span class="rot" id="rot" style="min-width:${sampleWidth}ch"><span class="rot__t">${sample}</span></span>`;
+  const rotate = `<span class="rot" id="rot"><span class="rot__t">${sample}</span></span>`;
 
   const rows = files.length
     ? files.map((f, i) => scriptEntry(f, i, notes)).join("")
@@ -270,23 +270,28 @@ h1, h2, h3 {
   backdrop-filter: blur(8px);
   border-bottom-color: var(--line);
 }
-.hdr__in { display: flex; align-items: center; justify-content: space-between; }
+.hdr__in { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); }
 .logo {
   display: flex; align-items: baseline; gap: var(--s2);
   text-decoration: none;
   color: var(--ink);
+  min-width: 0;
+  overflow: hidden;
 }
-.logo__k { font-family: var(--f-display); font-size: 1.05rem; }
+.logo__k { font-family: var(--f-display); font-size: 1.05rem; flex-shrink: 0; }
 .logo__t {
   font-family: var(--f-mono);
-  font-size: .75rem;
+  font-size: clamp(.65rem, .55rem + .5vw, .75rem);
   letter-spacing: .04em;
   color: var(--ink-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.hdr__right { display: flex; align-items: center; gap: var(--s5); }
+.hdr__right { display: flex; align-items: center; gap: clamp(var(--s3), 3vw, var(--s5)); flex-shrink: 0; }
 .hdr-link {
   font-weight: 500;
-  font-size: .66rem;
+  font-size: clamp(.6rem, .55rem + .25vw, .66rem);
   letter-spacing: .18em;
   text-transform: uppercase;
   color: var(--ink-muted);
@@ -410,9 +415,9 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
   background: var(--paper-raised);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: var(--s4);
+  padding: clamp(var(--s3), 3vw, var(--s4));
   font-family: var(--f-mono);
-  font-size: .76rem;
+  font-size: clamp(.69rem, .63rem + .3vw, .76rem);
   line-height: 1.7;
   color: var(--ink-dim);
   overflow-x: auto;
@@ -423,14 +428,33 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
 .comment { color: var(--ink-faint); }
 .hl { color: var(--ink); }
 
+/* ── ascii diagram: scroll, never reflow ── */
+.readout--tree {
+  white-space: pre;
+  word-break: normal;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+.readout--tree::-webkit-scrollbar { height: 4px; }
+.readout--tree::-webkit-scrollbar-thumb { background: var(--line); }
+
 /* ── rotating sample name ───────────────── */
-.readout--rows { white-space: normal; display: grid; gap: var(--s2); }
-.rl { display: flex; align-items: baseline; gap: var(--s4); flex-wrap: wrap; }
-.rl__cmd { white-space: pre; }
-.rl .comment { margin-left: auto; white-space: nowrap; }
+.readout--rows { white-space: normal; display: grid; gap: var(--s4); }
+.rl { display: grid; gap: 2px; min-width: 0; }
+.rl__cmd {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  padding-left: 2ch;
+  text-indent: -2ch;
+  min-width: 0;
+}
+.rl .comment { order: -1; }
 .rot {
   display: inline-block;
   position: relative;
+  text-indent: 0;
   text-align: left;
   color: var(--bone);
 }
@@ -466,6 +490,7 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
   gap: var(--s4);
 }
 .entry:last-of-type { border-bottom: none; padding-bottom: 0; }
+.entry > * { min-width: 0; }
 .entry__head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s4); flex-wrap: wrap; }
 .entry__idx {
   font-family: var(--f-mono);
@@ -480,29 +505,34 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
   font-size: clamp(1.5rem, 1.1rem + 1.6vw, 2.1rem);
   color: var(--ink);
 }
-.entry__meta { font-family: var(--f-mono); font-size: .7rem; color: var(--ink-faint); text-align: right; }
+.entry__meta { font-family: var(--f-mono); font-size: .7rem; color: var(--ink-faint); text-align: left; overflow-wrap: anywhere; }
 .entry__note { color: var(--ink-muted); max-width: 62ch; }
 .cmd {
   display: flex; align-items: stretch; gap: 0;
+  flex-direction: column;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--paper-raised);
   transition: border-color var(--move);
+  min-width: 0;
 }
 .cmd:hover { border-color: var(--line-strong); }
 .cmd__text {
   flex: 1;
-  padding: var(--s3) var(--s4);
+  min-width: 0;
+  padding: var(--s3) clamp(var(--s3), 3vw, var(--s4));
   font-family: var(--f-mono);
-  font-size: .76rem;
+  font-size: clamp(.69rem, .63rem + .3vw, .76rem);
   color: var(--ink);
-  overflow-x: auto;
-  white-space: nowrap;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  padding-left: calc(clamp(var(--s3), 3vw, var(--s4)) + 2ch);
+  text-indent: -2ch;
 }
 .cmd__btn {
   flex-shrink: 0;
   border: none;
-  border-left: 1px solid var(--line);
+  border-top: 1px solid var(--line);
   background: transparent;
   color: var(--ink-muted);
   font-family: var(--f-sans);
@@ -510,13 +540,14 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
   font-size: .625rem;
   letter-spacing: .12em;
   text-transform: uppercase;
-  padding: 0 var(--s4);
+  padding: var(--s3) var(--s4);
+  text-align: right;
   cursor: pointer;
   transition: background var(--move), color var(--move);
 }
 .cmd__btn:hover { background: var(--tint5); color: var(--ink); }
 .cmd__btn.done { color: var(--bone); }
-.entry__links { display: flex; gap: var(--s5); }
+.entry__links { display: flex; gap: var(--s5); flex-wrap: wrap; }
 .glink {
   font-weight: 500;
   font-size: .625rem;
@@ -546,8 +577,9 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
   position: relative;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: var(--s6);
+  padding: clamp(var(--s4), 4vw, var(--s6));
   background: var(--paper-raised);
+  min-width: 0;
 }
 .tick { position: absolute; width: 12px; height: 12px; pointer-events: none; }
 .tick:before, .tick:after { content: ""; position: absolute; background: var(--ink-faint); }
@@ -599,6 +631,25 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
 }
 .ftr__bar a { text-decoration: none; transition: color var(--move); }
 .ftr__bar a:hover { color: var(--ink); }
+
+@media (min-width: 660px) {
+  .readout--rows { gap: var(--s2); }
+  .rl { display: flex; align-items: baseline; gap: var(--s5); }
+  .rl__cmd { padding-left: 0; text-indent: 0; }
+  .rl .comment { order: 0; margin-left: auto; white-space: nowrap; flex-shrink: 0; }
+  .rot { min-width: var(--rotw); }
+  .entry__meta { text-align: right; }
+  .cmd { flex-direction: row; align-items: stretch; }
+  .cmd__text {
+    white-space: nowrap;
+    overflow-x: auto;
+    padding-left: var(--s4);
+    text-indent: 0;
+    scrollbar-width: none;
+  }
+  .cmd__text::-webkit-scrollbar { display: none; }
+  .cmd__btn { border-top: none; border-left: 1px solid var(--line); padding: 0 var(--s4); }
+}
 
 @media (min-width: 780px) {
   .hero__grid { grid-template-columns: 1.15fr .85fr; align-items: start; gap: var(--s8); }
@@ -671,7 +722,7 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
         <h2 class="stmt">The repository is the deployment.</h2>
       </div>
       <div class="notes">
-        <div class="readout">GET https://${DOMAIN}/<span class="comment">&lt;file&gt;</span>
+        <div class="readout readout--tree">GET https://${DOMAIN}/<span class="comment">&lt;file&gt;</span>
   <span class="comment">│</span>
   <span class="comment">├─</span> edge cache hit  <span class="comment">→ served, 0 hops</span>
   <span class="comment">└─</span> miss
@@ -701,7 +752,7 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
         <span class="tick tick--bl"></span><span class="tick tick--br"></span>
         <h2 class="stmt" style="margin-bottom:var(--s5)">Read it before you run it.</h2>
         <p class="entry__note">Piping a URL into a shell hands it your machine. These scripts are mine and they are short on purpose — open the file, read it end to end, then decide. Drop the pipe to inspect first:</p>
-        <div class="readout readout--rows" style="margin-top:var(--s5)"><span class="rl"><span class="rl__cmd"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/</span>${rotate}</span><span class="comment"># print it</span></span>
+        <div class="readout readout--rows" style="margin-top:var(--s5);--rotw:${sampleWidth}ch"><span class="rl"><span class="rl__cmd"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/</span>${rotate}</span><span class="comment"># print it</span></span>
 <span class="rl"><span class="rl__cmd"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/</span>${rotate.replace('id="rot"', 'id="rot2"')}<span class="hl"> | sh</span></span><span class="comment"># then run it</span></span></div>
       </div>
     </div>
