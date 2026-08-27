@@ -8,7 +8,7 @@
   "sudo": {
     "title": "Install sudo",
     "kanji": "権",
-    "note": "Installs sudo on a minimal box and puts your account in the admin group. Picks the user from the argument, then the login name, then the only regular account it finds — and refuses to guess when several exist. Must be started as root: sudo is the thing that is missing.",
+    "note": "Installs sudo on a minimal box and puts your account in the admin group. Picks the user from the argument, then the login name, then the only regular account it finds — and refuses to guess when several exist. Elevates itself through su when sudo is not there yet, so it can be piped straight into sh.",
     "target": "Debian · Ubuntu · Fedora · Arch · Alpine"
   }
 }

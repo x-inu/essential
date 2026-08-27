@@ -13,7 +13,15 @@ const HIDDEN = new Set([
   "package.json",
   "package-lock.json",
   "meta.json",
+  "favicon.svg",
+  "favicon.png",
+  "icon.png",
 ]);
+
+const FAVICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<rect width="64" height="64" fill="#000"/>
+<text x="32" y="33" fill="#cdc4ba" font-family="Georgia,'Times New Roman',serif" font-size="46" text-anchor="middle" dominant-baseline="central">源</text>
+</svg>`;
 
 const FALLBACK_NOTES = {
   cinit: {
@@ -25,7 +33,7 @@ const FALLBACK_NOTES = {
   sudo: {
     title: "Install sudo",
     kanji: "権",
-    note: "Installs sudo on a minimal box and puts your account in the admin group. Must be started as root: sudo is the thing that is missing.",
+    note: "Installs sudo on a minimal box and puts your account in the admin group. Elevates itself through su when sudo is not there yet, so it can be piped straight into sh.",
     target: "Debian · Ubuntu · Fedora · Arch · Alpine",
   },
 };
@@ -37,6 +45,15 @@ export default {
 
     if (path === "/" || path === "") {
       return serveIndex();
+    }
+
+    if (path === "/favicon.svg" || path === "/favicon.ico") {
+      return new Response(FAVICON, {
+        headers: {
+          "content-type": "image/svg+xml; charset=utf-8",
+          "cache-control": "public, max-age=86400",
+        },
+      });
     }
 
     const cache = caches.default;
@@ -140,7 +157,10 @@ async function serveIndex() {
 
 function render(files, notes) {
   const total = files.reduce((n, f) => n + f.size, 0);
-  const sample = files.length ? esc(files[0].name) : "cinit";
+  const names = files.length ? files.map(f => f.name) : ["cinit"];
+  const sample = esc(names[0]);
+  const sampleWidth = Math.max(...names.map(n => n.length));
+  const rotate = `<span class="rot" id="rot" style="min-width:${sampleWidth}ch"><span class="rot__t">${sample}</span></span>`;
 
   const rows = files.length
     ? files.map((f, i) => scriptEntry(f, i, notes)).join("")
@@ -151,9 +171,11 @@ function render(files, notes) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${DOMAIN} — script index</title>
+<title>源 raw.xinu</title>
 <meta name="description" content="Shell scripts from ${REPO}, served from the Cloudflare edge. One curl away.">
 <meta name="color-scheme" content="dark">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..600&family=Space+Grotesk:wght@400;500&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
@@ -401,6 +423,40 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
 .comment { color: var(--ink-faint); }
 .hl { color: var(--ink); }
 
+/* ── rotating sample name ───────────────── */
+.readout--rows { white-space: normal; display: grid; gap: var(--s2); }
+.rl { display: flex; align-items: baseline; gap: var(--s4); flex-wrap: wrap; }
+.rl__cmd { white-space: pre; }
+.rl .comment { margin-left: auto; white-space: nowrap; }
+.rot {
+  display: inline-block;
+  position: relative;
+  text-align: left;
+  color: var(--bone);
+}
+.rot__t {
+  display: inline-block;
+  transition: opacity .26s var(--ease-out), transform .26s var(--ease-out);
+}
+.rot.is-out .rot__t { opacity: 0; transform: translateY(-.4em); }
+.rot.is-live:before,
+.rot.is-live:after {
+  content: "";
+  position: absolute;
+  left: 0; bottom: -4px;
+  height: 1px;
+}
+.rot.is-live:before { right: 0; background: var(--line-soft); }
+.rot.is-live:after {
+  width: 100%;
+  background: var(--bone);
+  opacity: .55;
+  transform: scaleX(0);
+  transform-origin: left;
+  animation: rotTick 3s linear infinite;
+}
+@keyframes rotTick { from { transform: scaleX(0) } to { transform: scaleX(1) } }
+
 /* ── scripts ────────────────────────────── */
 .entry {
   border-bottom: 1px solid var(--line-soft);
@@ -645,8 +701,8 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
         <span class="tick tick--bl"></span><span class="tick tick--br"></span>
         <h2 class="stmt" style="margin-bottom:var(--s5)">Read it before you run it.</h2>
         <p class="entry__note">Piping a URL into a shell hands it your machine. These scripts are mine and they are short on purpose — open the file, read it end to end, then decide. Drop the pipe to inspect first:</p>
-        <div class="readout" style="margin-top:var(--s5)"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/${sample}</span>${" ".repeat(10)}<span class="comment"># print it</span>
-<span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/${sample} | sh</span>${" ".repeat(5)}<span class="comment"># then run it</span></div>
+        <div class="readout readout--rows" style="margin-top:var(--s5)"><span class="rl"><span class="rl__cmd"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/</span>${rotate}</span><span class="comment"># print it</span></span>
+<span class="rl"><span class="rl__cmd"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/</span>${rotate.replace('id="rot"', 'id="rot2"')}<span class="hl"> | sh</span></span><span class="comment"># then run it</span></span></div>
       </div>
     </div>
   </section>
@@ -682,6 +738,23 @@ document.querySelectorAll("[data-copy]").forEach(btn => {
     } catch {}
   });
 });
+
+const rotNames = ${JSON.stringify(names).replace(/</g, "\\u003c")};
+const rots = ["rot", "rot2"].map(id => document.getElementById(id)).filter(Boolean);
+if (rots.length && rotNames.length > 1 && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  rots.forEach(r => r.classList.add("is-live"));
+  let i = 0;
+  setInterval(() => {
+    i = (i + 1) % rotNames.length;
+    rots.forEach(r => r.classList.add("is-out"));
+    setTimeout(() => {
+      rots.forEach(r => {
+        r.querySelector(".rot__t").textContent = rotNames[i];
+        r.classList.remove("is-out");
+      });
+    }, 260);
+  }, 3000);
+}
 </script>
 </body>
 </html>`;
