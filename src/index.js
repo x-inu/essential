@@ -199,6 +199,7 @@ function render(files, notes) {
   --f-mono: "Space Mono", ui-monospace, monospace;
 
   --max: 1080px;
+  --wide: 1440px;
   --gutter: clamp(1.15rem, 4vw, 3rem);
   --section-y: clamp(2rem, 5vw, 3.5rem);
   --radius: 2px;
@@ -211,8 +212,13 @@ function render(files, notes) {
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
+*:before, *:after { box-sizing: border-box; }
 
 html { color-scheme: dark; }
+
+html, body { width: 100%; max-width: 100%; overflow-x: clip; }
+
+img, svg, video { max-width: 100%; }
 
 body {
   background: var(--paper);
@@ -222,7 +228,6 @@ body {
   line-height: 1.62;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
-  overflow-x: hidden;
 }
 
 body:before {
@@ -250,7 +255,10 @@ h1, h2, h3 {
   font-variation-settings: "opsz" 144, "SOFT" 0, "WONK" 0;
 }
 
-.wrap { max-width: var(--max); margin-inline: auto; padding-inline: var(--gutter); width: 100%; }
+/* Reading width for prose, commands and the script list. */
+.wrap { width: 100%; max-width: var(--max); margin-inline: auto; padding-inline: var(--gutter); }
+/* Structural width for the header, the footer and large decorative type. */
+.wrap-wide { width: 100%; max-width: var(--wide); margin-inline: auto; padding-inline: var(--gutter); }
 .mono { font-family: var(--f-mono); }
 .tnum { font-variant-numeric: tabular-nums; }
 
@@ -358,6 +366,7 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
   position: relative;
 }
 .hero__grid { display: grid; grid-template-columns: 1fr; gap: var(--s6); }
+.hero__grid > *, .two > *, .entry > * { min-width: 0; }
 .hero h1 {
   font-family: var(--f-mono);
   font-weight: 400;
@@ -420,6 +429,7 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
   font-size: clamp(.69rem, .63rem + .3vw, .76rem);
   line-height: 1.7;
   color: var(--ink-dim);
+  max-width: 100%;
   overflow-x: auto;
   white-space: pre-wrap;
   word-break: break-word;
@@ -645,19 +655,21 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
   .two { grid-template-columns: .95fr 1.05fr; }
 }
 
+/* No blanket animation reset: every animation here is either information
+   (the rotating name) or a small, slow cue, so all of them keep running.
+   Only instant scrolling is honoured, which is what actually causes trouble. */
 @media (prefers-reduced-motion: reduce) {
-  *, *:before, *:after { animation: none !important; transition-duration: .001ms !important; }
+  html { scroll-behavior: auto; }
 
-  /* The rotation is information, not decoration: it shows which names are
-     published, and its animation is also the clock that swaps the text. */
   .rot.is-live .rot__t { animation: rotFade 3s linear infinite !important; }
+  .dot { animation: blink 1.5s infinite !important; }
 }
 </style>
 </head>
 <body>
 
 <header class="hdr" id="hdr">
-  <div class="wrap hdr__in">
+  <div class="wrap-wide hdr__in">
     <a class="logo" href="/">
       <span class="logo__k">源</span>
       <span class="logo__t">${DOMAIN}</span>
@@ -752,7 +764,7 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
 </main>
 
 <footer class="ftr">
-  <div class="wrap">
+  <div class="wrap-wide">
     <div class="ftr__word">RAW</div>
     <div class="ftr__bar">
       <span>One source of truth · ${REPO}</span>
