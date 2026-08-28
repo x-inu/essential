@@ -458,6 +458,8 @@ test("index uses one commit and shows simple direct commands for every tool", as
   assert.match(html, /# then run it/);
   assert.match(html, /\.command-row\{display:grid;grid-template-columns:minmax\(0,1fr\) auto/);
   assert.match(html, /\.readout--rows \.rot\{min-width:0\}/);
+  assert.match(html, /\.quick-command\{display:block;white-space:nowrap;overflow-x:auto\}/);
+  assert.match(html, /<span class="quick-command">.*?id="rot".*? \| sh<\/span><\/span>/);
   assert.match(html, /<span class="rot" id="rot3">.*?<\/span><span class="hl"> \| sh<\/span>/);
   assert.doesNotMatch(html, /sha256sum -c -/);
   assert.doesNotMatch(html, /mktemp/);
