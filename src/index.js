@@ -659,6 +659,11 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
 
 @media (prefers-reduced-motion: reduce) {
   *, *:before, *:after { animation: none !important; transition-duration: .001ms !important; }
+
+  /* The rotation carries meaning — it shows which names are published —
+     so keep it and its progress line running. */
+  .rot__t { transition-duration: .26s !important; }
+  .rot.is-live:after { animation: rotTick 3s linear infinite !important; }
 }
 </style>
 </head>
@@ -792,7 +797,7 @@ document.querySelectorAll("[data-copy]").forEach(btn => {
 
 const rotNames = ${JSON.stringify(names).replace(/</g, "\\u003c")};
 const rots = ["rot", "rot2"].map(id => document.getElementById(id)).filter(Boolean);
-if (rots.length && rotNames.length > 1 && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+if (rots.length && rotNames.length > 1) {
   rots.forEach(r => r.classList.add("is-live"));
   let i = 0;
   setInterval(() => {
