@@ -102,7 +102,7 @@ jobs:
         run: node --check src/index.js
 
       - name: Test Worker
-        run: node --test tests/worker.test.js
+        run: node --test verification/worker_security.test.js
 
       - name: Test POSIX tools
-        run: ./tests/run.sh
+        run: ./verification/run_posix_tool_tests.sh

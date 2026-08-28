@@ -234,15 +234,15 @@ after checking network configuration and unit state.
 
 ```text
 .
-├── .github/workflows/ci.yml  # Linux CI: lint, parse, Worker tests, tool tests
+├── .github/workflows/ci.yml  # Linux CI: lint, parse, and verification
 ├── LICENSE                   # GNU GPL version 3
 ├── README.md
 ├── meta.json                 # Exact public metadata allowlist
 ├── src/index.js              # Cloudflare Worker, routes, hashing, and landing page
-├── tests/
-│   ├── run.sh                # Python unittest entry point
-│   ├── test_posix_tools.py   # Mocked filesystem/admin-command tool tests
-│   └── worker.test.js        # Node Worker routing/security/cache tests
+├── verification/
+│   ├── run_posix_tool_tests.sh  # Python unittest entry point
+│   ├── posix_tools_test.py      # Mocked filesystem/admin-command verification
+│   └── worker_security.test.js  # Worker routing/security/cache verification
 ├── tools/
 │   ├── cinit
 │   └── sudo
@@ -257,7 +257,7 @@ directories recursively.
 
 Requirements are a current Node.js release with Web APIs used by the Worker
 and Wrangler. No application dependency installation is required for the Node
-test suite.
+verification suite.
 
 ```sh
 npx wrangler dev
@@ -272,7 +272,7 @@ curl -i http://localhost:8787/sudo
 
 The local Worker runs the checked-out `src/index.js`, but its normal upstream
 fetches still read `meta.json` and tools from `x-inu/essential` on GitHub.
-Unpublished local manifest/tool changes are covered by the mocked tests rather
+Unpublished local manifest/tool changes are covered by mocked verification rather
 than automatically becoming the Worker's upstream content.
 
 An optional `GITHUB_TOKEN` Worker secret increases authenticated GitHub API
@@ -292,15 +292,15 @@ shellcheck tools/*
 shfmt -d tools/*
 for tool in tools/*; do dash -n "$tool"; bash -n "$tool"; done
 node --check src/index.js
-node --test tests/worker.test.js
-./tests/run.sh
+node --test verification/worker_security.test.js
+./verification/run_posix_tool_tests.sh
 ```
 
 Run the file-count and executable checks from the workflow as well; the short
 loop above is for convenience and assumes the repository's nonempty `tools/`
-directory. `tests/run.sh` needs Python 3 and uses temporary trees plus mocked
-administrative commands; it does not modify the host's real `/etc` or
-`/var/backups`.
+directory. `verification/run_posix_tool_tests.sh` needs Python 3 and uses
+temporary trees plus mocked administrative commands; it does not modify the
+host's real `/etc` or `/var/backups`.
 
 ## Deploy
 
@@ -367,9 +367,9 @@ GitHub commit.
    with `source` exactly `tools/<name>`.
 5. Confirm the existing Worker route and source validators accept the new
    manifest entry without broadening either validation pattern.
-6. Extend `tests/test_posix_tools.py` with success, refusal, elevation,
+6. Extend `verification/posix_tools_test.py` with success, refusal, elevation,
    idempotence, verification, failure, and rollback cases without touching the
-   host, and extend `tests/worker.test.js` for the exact manifest and both
+   host, and extend `verification/worker_security.test.js` for the exact manifest and both
    mutable and immutable routes.
 7. Update this README's tool table, Linux support matrix, usage, rollback,
    repository tree, and any security or release notes affected by the tool.

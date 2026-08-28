@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mock-based tests: the tools only see temporary etc/var trees and fake admin commands."""
+"""Verify POSIX tools using temporary etc/var trees and fake admin commands."""
 
 import os
 import shutil
