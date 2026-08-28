@@ -454,6 +454,8 @@ test("index uses one commit and shows simple direct commands for every tool", as
   assert.match(html, /curl -fsSL https:\/\/raw\.xinu\.my\.id\/sudo \| sh/);
   assert.match(html, /id="rot2"/);
   assert.match(html, /id="rot3"/);
+  assert.match(html, new RegExp(`GET /v/${SHA}/<span class="rot" id="rot4"><span class="rot__t">cinit</span>`));
+  assert.doesNotMatch(html, new RegExp(`GET /v/${SHA}/<span class="comment">&lt;name&gt;</span>`));
   assert.match(html, /# print it/);
   assert.match(html, /# then run it/);
   assert.match(html, /\.command-row\{display:grid;grid-template-columns:minmax\(0,1fr\) auto/);
