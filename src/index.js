@@ -1,170 +1,372 @@
-const GITHUB_RAW = "https://raw.githubusercontent.com/x-inu/essential/main";
-const GITHUB_API = "https://api.github.com/repos/x-inu/essential/git/trees/main";
-const JSDELIVR_API = "https://data.jsdelivr.com/v1/packages/gh/x-inu/essential@main?structure=flat";
 const REPO = "x-inu/essential";
 const BRANCH = "main";
-const CACHE_TTL = 300;
 const DOMAIN = "raw.xinu.my.id";
-
-const HIDDEN = new Set([
-  "LICENSE",
-  "README.md",
-  "wrangler.toml",
-  "package.json",
-  "package-lock.json",
-  "meta.json",
-  "favicon.svg",
-  "favicon.png",
-  "icon.png",
-]);
+const RAW_ORIGIN = "https://raw.githubusercontent.com";
+const API_ORIGIN = "https://api.github.com";
+const CACHE_TTL = 300;
+const IMMUTABLE_TTL = 31536000;
+const UPSTREAM_TIMEOUT_MS = 8000;
+const VERSION_RE = /^[a-f0-9]{40}$/;
+const PUBLIC_NAME_RE = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/;
+const INTERNAL_NAMES = new Set(["meta.json", "wrangler.toml"]);
 
 const FAVICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
 <rect width="64" height="64" fill="#000"/>
 <text x="32" y="33" fill="#cdc4ba" font-family="Georgia,'Times New Roman',serif" font-size="46" text-anchor="middle" dominant-baseline="central">源</text>
 </svg>`;
 
-const FALLBACK_NOTES = {
-  cinit: {
-    title: "Disable cloud-init",
-    kanji: "止",
-    note: "Stops cloud-init from reclaiming your network config on the next boot. Writes the disable flag, masks the four units, pins network config off.",
-    target: "Debian · Ubuntu · any systemd host with /etc/cloud",
-  },
-  sudo: {
-    title: "Install sudo",
-    kanji: "権",
-    note: "Installs sudo on a minimal box and puts your account in the admin group. Elevates itself through su when sudo is not there yet, so it can be piped straight into sh.",
-    target: "Debian · Ubuntu · Fedora · Arch · Alpine",
-  },
-};
-
-export default {
-  async fetch(request) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    if (path === "/" || path === "") {
-      return serveIndex();
-    }
-
-    if (path === "/favicon.svg" || path === "/favicon.ico") {
-      return new Response(FAVICON, {
-        headers: {
-          "content-type": "image/svg+xml; charset=utf-8",
-          "cache-control": "public, max-age=86400",
-        },
-      });
-    }
-
-    const cache = caches.default;
-    const cacheKey = new Request(url.toString(), request);
-    const cached = await cache.match(cacheKey);
-
-    if (cached) {
-      return cached;
-    }
-
-    const res = await fetch(`${GITHUB_RAW}${path}`, {
-      headers: { "User-Agent": `${DOMAIN} proxy` },
-    });
-
-    if (!res.ok) {
-      return new Response("not found\n", { status: 404 });
-    }
-
-    const response = new Response(res.body, {
-      status: 200,
-      headers: {
-        "content-type": guessType(path),
-        "cache-control": `public, max-age=${CACHE_TTL}`,
-        "x-source": "github",
-      },
-    });
-
-    request.method === "GET" && cache.put(cacheKey, response.clone());
-
-    return response;
-  },
-};
-
-function keep(name) {
-  return !name.includes("/") && !name.startsWith(".") && !HIDDEN.has(name);
-}
-
-async function listFiles() {
-  const viaGitHub = await listViaGitHub();
-  if (viaGitHub.length) return viaGitHub;
-  return listViaJsdelivr();
-}
-
-async function listViaGitHub() {
-  try {
-    const res = await fetch(`${GITHUB_API}?recursive=1`, {
-      headers: { "User-Agent": `${DOMAIN} proxy` },
-    });
-    if (!res.ok) return [];
-    const data = await res.json();
-    if (!data || !Array.isArray(data.tree)) return [];
-    return data.tree
-      .filter(f => f.type === "blob" && keep(f.path))
-      .map(f => ({ name: f.path, size: f.size }));
-  } catch {
-    return [];
+class UpstreamError extends Error {
+  constructor(kind, message, status = 0, retryAfter = "") {
+    super(message);
+    this.name = "UpstreamError";
+    this.kind = kind;
+    this.status = status;
+    this.retryAfter = retryAfter;
   }
 }
 
-async function listViaJsdelivr() {
-  try {
-    const res = await fetch(JSDELIVR_API, {
-      headers: { "User-Agent": `${DOMAIN} proxy` },
-    });
-    if (!res.ok) return [];
-    const data = await res.json();
-    if (!data || !Array.isArray(data.files)) return [];
-    return data.files
-      .map(f => ({ name: String(f.name || "").replace(/^\//, ""), size: f.size }))
-      .filter(f => f.name && keep(f.name));
-  } catch {
-    return [];
+export async function fetch(request, env = {}, ctx = {}) {
+  const method = String(request.method || "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    return textResponse("method not allowed\n", 405, request, { Allow: "GET, HEAD" });
   }
+
+  const url = new URL(request.url);
+  const isIndex = url.pathname === "/" || url.pathname === "";
+  const isFavicon = url.pathname === "/favicon.svg" || url.pathname === "/favicon.ico";
+  const route = isIndex || isFavicon ? null : resolveTool(url.pathname);
+  if (!isIndex && !isFavicon && !route) return textResponse("not found\n", 404, request);
+
+  const cache = getDefaultCache();
+  const cacheKey = normalizedCacheKey(request, url);
+
+  if (cache && cacheKey) {
+    try {
+      const cached = await cache.match(cacheKey);
+      if (cached) {
+        return new Response(isHead(request) ? null : cached.body, {
+          status: cached.status,
+          statusText: cached.statusText,
+          headers: securityHeaders(cached.headers),
+        });
+      }
+    } catch (error) {
+      // Cache availability must never make the origin unavailable.
+      console.warn("cache read failed", error);
+    }
+  }
+
+  let response;
+  try {
+    if (isIndex) {
+      response = await serveIndex(request, env);
+    } else if (isFavicon) {
+      response = faviconResponse(request);
+    } else {
+      const snapshot = route.versioned
+        ? { commit: route.ref, manifest: await loadManifest(route.ref, env) }
+        : await resolveMutableRef(env);
+      const manifest = snapshot.manifest;
+      const tool = manifest.find((item) => item.name === route.name);
+      if (!tool) return textResponse("not found\n", 404, request);
+
+      response = await serveTool(request, tool, snapshot.commit, route.versioned, env);
+      if (!route.versioned) response.headers.set("X-Commit-SHA", snapshot.commit);
+    }
+  } catch (error) {
+    response = upstreamErrorResponse(error, request);
+  }
+
+  if (method === "GET" && cache && cacheKey && response.status === 200) {
+    const write = cache.put(cacheKey, response.clone()).catch((error) => {
+      if (env && typeof env.onCacheError === "function") env.onCacheError(error);
+      else console.warn("cache write failed", error);
+    });
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(write);
+  }
+
+  return response;
 }
 
-async function loadNotes() {
-  try {
-    const res = await fetch(`${GITHUB_RAW}/meta.json`, {
-      headers: { "User-Agent": `${DOMAIN} proxy` },
-    });
-    if (!res.ok) return FALLBACK_NOTES;
-    const data = await res.json();
-    return data && typeof data === "object" ? data : FALLBACK_NOTES;
-  } catch {
-    return FALLBACK_NOTES;
+export default { fetch };
+
+export async function loadManifest(ref = BRANCH, env = {}) {
+  if (ref !== BRANCH && !VERSION_RE.test(ref)) {
+    throw new UpstreamError("manifest", "invalid manifest ref");
   }
+
+  const url = rawUrl(ref, "meta.json");
+  const response = await upstreamBytes(url, env, false, "manifest");
+  let value;
+  try {
+    value = JSON.parse(new TextDecoder().decode(response.bytes));
+  } catch {
+    throw new UpstreamError("manifest", "invalid upstream manifest");
+  }
+
+  if (!isPlainObject(value)) {
+    throw new UpstreamError("manifest", "invalid upstream manifest");
+  }
+
+  const seen = new Set();
+  const tools = Object.entries(value).map(([name, item]) => {
+    if (!isPlainObject(item)) throw new UpstreamError("manifest", "invalid upstream manifest");
+    const keys = Object.keys(item).sort();
+    const expected = ["kanji", "note", "requires_root", "shell", "source", "target", "title"];
+    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+      throw new UpstreamError("manifest", "invalid upstream manifest");
+    }
+
+    const { source, title, kanji, note, target, shell, requires_root: requiresRoot } = item;
+    if (
+      !validatePublicName(name) ||
+      !validateSourcePath(source, name) ||
+      seen.has(name) ||
+      !nonEmptyText(title, 120) ||
+      !nonEmptyText(kanji, 8) ||
+      !nonEmptyText(note, 600) ||
+      !Array.isArray(target) ||
+      target.length === 0 ||
+      target.some((os) => !validatePublicName(os)) ||
+      shell !== "sh" ||
+      requiresRoot !== true
+    ) {
+      throw new UpstreamError("manifest", "invalid upstream manifest");
+    }
+
+    seen.add(name);
+    return { name, source, title, kanji, note, target, shell, requiresRoot };
+  });
+
+  if (tools.length === 0) throw new UpstreamError("manifest", "invalid upstream manifest");
+
+  return tools;
 }
 
-async function serveIndex() {
-  const [files, notes] = await Promise.all([listFiles(), loadNotes()]);
+export function validatePublicName(name) {
+  return typeof name === "string" && PUBLIC_NAME_RE.test(name);
+}
+
+export function validateSourcePath(source, publicName) {
+  if (typeof source !== "string" || source.includes("\\") || source.includes("%")) return false;
+  const match = /^tools\/([a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?)$/.exec(source);
+  return Boolean(match && validatePublicName(match[1]) && (!publicName || match[1] === publicName));
+}
+
+export function resolveTool(pathname) {
+  if (typeof pathname !== "string") return null;
+
+  const direct = /^\/([a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?)$/.exec(pathname);
+  if (direct) {
+    const name = direct[1];
+    if (!validatePublicName(name) || INTERNAL_NAMES.has(name)) return null;
+    return { name, ref: BRANCH, versioned: false };
+  }
+
+  const versioned = /^\/v\/([a-f0-9]{40})\/([a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?)$/.exec(pathname);
+  if (!versioned) return null;
+  const [, ref, name] = versioned;
+  if (!VERSION_RE.test(ref) || !validatePublicName(name) || INTERNAL_NAMES.has(name)) return null;
+  return { name, ref, versioned: true };
+}
+
+export async function fetchTool(tool, ref = BRANCH, env = {}) {
+  if (
+    !tool ||
+    !validatePublicName(tool.name) ||
+    !validateSourcePath(tool.source, tool.name) ||
+    (ref !== BRANCH && !VERSION_RE.test(ref))
+  ) {
+    throw new UpstreamError("manifest", "invalid upstream manifest");
+  }
+
+  const response = await upstreamBytes(rawUrl(ref, tool.source), env, false, "tool");
+  const { bytes } = response;
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return {
+    bytes,
+    size: bytes.byteLength,
+    sha256: hex(digest),
+    etag: response.headers.get("etag") || "",
+    lastModified: response.headers.get("last-modified") || "",
+  };
+}
+
+async function resolveMutableRef(env) {
+  const commit = await loadCommitSha(env);
+  return { commit, manifest: await loadManifest(commit, env) };
+}
+
+export async function serveTool(request, tool, ref = BRANCH, versioned = false, env = {}) {
+  const result = await fetchTool(tool, ref, env);
+  const headers = securityHeaders({
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": versioned
+      ? `public, max-age=${IMMUTABLE_TTL}, s-maxage=${IMMUTABLE_TTL}, immutable`
+      : `public, max-age=${CACHE_TTL}, s-maxage=${CACHE_TTL}`,
+    "X-Source": "github",
+  });
+  if (result.etag) headers.set("ETag", result.etag);
+  if (result.lastModified) headers.set("Last-Modified", result.lastModified);
+  return new Response(isHead(request) ? null : result.bytes, { status: 200, headers });
+}
+
+export async function serveIndex(request, env = {}) {
+  const commit = await loadCommitSha(env);
+  const manifest = await loadManifest(commit, env);
+  const files = await Promise.all(
+    manifest.map(async (tool) => ({ ...tool, ...(await fetchTool(tool, commit, env)) })),
+  );
   files.sort((a, b) => a.name.localeCompare(b.name));
-  const html = render(files, notes);
 
-  return new Response(html, {
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "cache-control": `public, max-age=${CACHE_TTL}`,
-    },
+  const nonce = createNonce();
+  const html = render(files, commit, nonce);
+  const headers = securityHeaders({
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": `public, max-age=${CACHE_TTL}, s-maxage=${CACHE_TTL}`,
+    "Content-Security-Policy": htmlCsp(nonce),
+  });
+  return new Response(isHead(request) ? null : html, { status: 200, headers });
+}
+
+async function loadCommitSha(env) {
+  const response = await upstreamBytes(`${API_ORIGIN}/repos/${REPO}/commits/${BRANCH}`, env, true, "commit");
+  let value;
+  try {
+    value = JSON.parse(new TextDecoder().decode(response.bytes));
+  } catch {
+    throw new UpstreamError("upstream", "invalid upstream response");
+  }
+  if (!value || !VERSION_RE.test(value.sha)) {
+    throw new UpstreamError("upstream", "invalid upstream response");
+  }
+  return value.sha;
+}
+
+async function upstreamBytes(url, env, api, resource) {
+  return upstreamFetch(url, env, api, async (response) => {
+    if (!response.ok) throw classifyUpstreamResponse(response, resource);
+    return { bytes: new Uint8Array(await response.arrayBuffer()), headers: response.headers };
   });
 }
 
-function render(files, notes) {
-  const total = files.reduce((n, f) => n + f.size, 0);
-  const names = files.length ? files.map(f => f.name) : ["cinit"];
-  const sample = esc(names[0]);
-  const sampleWidth = Math.max(...names.map(n => n.length));
-  const rotate = `<span class="rot" id="rot"><span class="rot__t">${sample}</span></span>`;
+async function upstreamFetch(url, env, api = false, consume = (response) => response) {
+  const controller = new AbortController();
+  const timeoutMs = positiveInteger(env && env.UPSTREAM_TIMEOUT_MS) || UPSTREAM_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const headers = new Headers({
+    Accept: api ? "application/vnd.github+json" : "application/octet-stream",
+    "User-Agent": `${DOMAIN} worker`,
+  });
+  if (api && env && env.GITHUB_TOKEN) headers.set("Authorization", `Bearer ${env.GITHUB_TOKEN}`);
 
-  const rows = files.length
-    ? files.map((f, i) => scriptEntry(f, i, notes)).join("")
-    : `<p class="empty">No scripts published on <span class="mono">${BRANCH}</span> yet.</p>`;
+  try {
+    const response = await globalThis.fetch(url, { headers, signal: controller.signal });
+    return await consume(response);
+  } catch (error) {
+    if (error instanceof UpstreamError) throw error;
+    if (error && (error.name === "AbortError" || controller.signal.aborted)) {
+      throw new UpstreamError("timeout", "upstream timeout");
+    }
+    throw new UpstreamError("network", "upstream unavailable");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function classifyUpstreamResponse(response, resource) {
+  const retryAfter = response.headers.get("retry-after") || "";
+  if (response.status === 404) return new UpstreamError("not-found", `${resource} not found`, 404);
+  if (response.status === 429 || response.status === 403) {
+    return new UpstreamError("rate-limit", "upstream rate limited", response.status, retryAfter);
+  }
+  return new UpstreamError("upstream", "upstream unavailable", response.status);
+}
+
+function upstreamErrorResponse(error, request) {
+  if (!(error instanceof UpstreamError)) return textResponse("upstream unavailable\n", 502, request);
+  if (error.kind === "not-found") return textResponse("not found\n", 404, request);
+  if (error.kind === "rate-limit") {
+    const extra = error.retryAfter ? { "Retry-After": error.retryAfter } : {};
+    return textResponse("upstream rate limited\n", 503, request, extra);
+  }
+  if (error.kind === "timeout") return textResponse("upstream timeout\n", 504, request);
+  if (error.kind === "manifest") return textResponse("invalid upstream manifest\n", 502, request);
+  return textResponse("upstream unavailable\n", 502, request);
+}
+
+function normalizedCacheKey(request, url) {
+  const method = String(request.method).toUpperCase();
+  if (method !== "GET" && method !== "HEAD") return null;
+  return new Request(`${url.origin}${url.pathname}`, { method: "GET" });
+}
+
+function getDefaultCache() {
+  try {
+    return globalThis.caches && globalThis.caches.default ? globalThis.caches.default : null;
+  } catch (error) {
+    console.warn("Cache API unavailable", error);
+    return null;
+  }
+}
+
+function rawUrl(ref, source) {
+  const segments = source.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+  return `${RAW_ORIGIN}/${REPO}/${encodeURIComponent(ref)}/${segments}`;
+}
+
+function faviconResponse(request) {
+  return new Response(isHead(request) ? null : FAVICON, {
+    headers: securityHeaders({
+      "Content-Type": "image/svg+xml; charset=utf-8",
+      "Cache-Control": "public, max-age=86400",
+    }),
+  });
+}
+
+function textResponse(body, status, request, extra = {}) {
+  return new Response(isHead(request) ? null : body, {
+    status,
+    headers: securityHeaders({
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...extra,
+    }),
+  });
+}
+
+function securityHeaders(initial = {}) {
+  const headers = new Headers(initial);
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Referrer-Policy", "no-referrer");
+  headers.set("X-Frame-Options", "DENY");
+  headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()");
+  if (!headers.has("Content-Security-Policy")) {
+    headers.set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+  }
+  return headers;
+}
+
+function htmlCsp(nonce) {
+  return [
+    "default-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+    `script-src 'nonce-${nonce}'`,
+    `style-src 'nonce-${nonce}' https://fonts.googleapis.com`,
+    "font-src https://fonts.gstatic.com",
+    "img-src 'self' data:",
+    "connect-src 'none'",
+  ].join("; ");
+}
+
+function render(files, commit, nonce) {
+  const total = files.reduce((sum, file) => sum + file.size, 0);
+  const names = files.map((file) => file.name);
+  const sample = esc(names[0] || "tool");
+  const rows = files.map((file, index) => scriptEntry(file, index, commit)).join("");
+  const safeNonce = esc(nonce);
 
   return `<!DOCTYPE html>
 <html lang="en" class="no-js">
@@ -172,686 +374,73 @@ function render(files, notes) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>源 raw.xinu</title>
-<meta name="description" content="Shell scripts from ${REPO}, served from the Cloudflare edge. One curl away.">
+<meta name="description" content="A verified allowlist of shell tools from ${REPO}, served from the Cloudflare edge.">
 <meta name="color-scheme" content="dark">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..600&family=Space+Grotesk:wght@400;500&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
-<style>
-:root {
-  --paper: #000;
-  --paper-raised: #0a0a0a;
-  --ink: #cdc4ba;
-  --ink-dim: #b0a9a0;
-  --ink-muted: #958f87;
-  --ink-faint: #7a756e;
-  --line: rgba(205,196,186,.26);
-  --line-soft: rgba(205,196,186,.13);
-  --line-strong: rgba(205,196,186,.42);
-  --tint5: rgba(205,196,186,.05);
-  --bone: #cdc4ba;
-  --ink-on-bone: #000;
-
-  --f-display: "Fraunces", ui-serif, Georgia, serif;
-  --f-sans: "Space Grotesk", system-ui, sans-serif;
-  --f-mono: "Space Mono", ui-monospace, monospace;
-
-  --max: 1080px;
-  --wide: 1440px;
-  --gutter: clamp(1.15rem, 4vw, 3rem);
-  --section-y: clamp(2rem, 5vw, 3.5rem);
-  --radius: 2px;
-  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px;
-  --s5: 24px; --s6: 32px; --s7: 48px; --s8: 64px;
-
-  --move: .17s;
-  --ease-out: cubic-bezier(.215,.61,.355,1);
-  --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='256' height='256'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.82' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='256' height='256' filter='url(%23n)'/%3E%3C/svg%3E");
-}
-
-* { margin: 0; padding: 0; box-sizing: border-box; }
-*:before, *:after { box-sizing: border-box; }
-
-html { color-scheme: dark; }
-
-html, body { width: 100%; max-width: 100%; overflow-x: clip; }
-
-img, svg, video { max-width: 100%; }
-
-body {
-  background: var(--paper);
-  color: var(--ink-dim);
-  font-family: var(--f-sans);
-  font-size: clamp(.92rem, .88rem + .2vw, 1rem);
-  line-height: 1.62;
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-}
-
-body:before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: 9999;
-  pointer-events: none;
-  background-image: var(--grain);
-  background-size: 256px 256px;
-  opacity: .055;
-}
-
-::selection { background: var(--ink); color: var(--paper); }
-
-a { color: inherit; }
-
-h1, h2, h3 {
-  font-family: var(--f-display);
-  font-weight: 400;
-  letter-spacing: -.01em;
-  line-height: .98;
-  color: var(--ink);
-  text-wrap: balance;
-  font-variation-settings: "opsz" 144, "SOFT" 0, "WONK" 0;
-}
-
-/* Reading width for prose, commands and the script list. */
-.wrap { width: 100%; max-width: var(--max); margin-inline: auto; padding-inline: var(--gutter); }
-/* Structural width for the header, the footer and large decorative type. */
-.wrap-wide { width: 100%; max-width: var(--wide); margin-inline: auto; padding-inline: var(--gutter); }
-.mono { font-family: var(--f-mono); }
-.tnum { font-variant-numeric: tabular-nums; }
-
-/* ── header ─────────────────────────────── */
-.hdr {
-  position: fixed;
-  top: 0; left: 0; right: 0;
-  height: 56px;
-  z-index: 100;
-  display: flex;
-  align-items: center;
-  transition: background var(--move), border-color var(--move);
-  border-bottom: 1px solid transparent;
-}
-.hdr.solid {
-  background: color-mix(in srgb, var(--paper) 90%, transparent);
-  backdrop-filter: blur(8px);
-  border-bottom-color: var(--line);
-}
-.hdr__in { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); }
-.logo {
-  display: flex; align-items: baseline; gap: var(--s2);
-  text-decoration: none;
-  color: var(--ink);
-  min-width: 0;
-  overflow: hidden;
-}
-.logo__k { font-family: var(--f-display); font-size: 1.05rem; flex-shrink: 0; }
-.logo__t {
-  font-family: var(--f-mono);
-  font-size: clamp(.65rem, .55rem + .5vw, .75rem);
-  letter-spacing: .04em;
-  color: var(--ink-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.hdr__right { display: flex; align-items: center; gap: clamp(var(--s3), 3vw, var(--s5)); flex-shrink: 0; }
-.hdr-link {
-  font-weight: 500;
-  font-size: clamp(.6rem, .55rem + .25vw, .66rem);
-  letter-spacing: .18em;
-  text-transform: uppercase;
-  color: var(--ink-muted);
-  text-decoration: none;
-  position: relative;
-  transition: color var(--move);
-}
-.hdr-link:after {
-  content: "";
-  position: absolute;
-  left: 0; bottom: -3px;
-  width: 100%; height: 1px;
-  background: currentColor;
-  transform: scaleX(0);
-  transform-origin: left;
-  transition: transform var(--move) var(--ease-out);
-}
-.hdr-link:hover { color: var(--ink); }
-.hdr-link:hover:after { transform: scaleX(1); }
-
-/* ── shared type ────────────────────────── */
-.eyebrow {
-  display: flex; align-items: center; gap: var(--s3);
-  font-weight: 500;
-  font-size: .66rem;
-  letter-spacing: .22em;
-  text-transform: uppercase;
-  color: var(--ink-muted);
-  margin-bottom: var(--s5);
-}
-.eyebrow__k { font-family: var(--f-display); font-size: .9rem; letter-spacing: 0; color: var(--ink); }
-.eyebrow:after {
-  content: "";
-  flex: 1;
-  height: 1px;
-  background: var(--line);
-}
-.label {
-  font-weight: 500;
-  font-size: .625rem;
-  letter-spacing: .14em;
-  text-transform: uppercase;
-  color: var(--ink-muted);
-}
-.micro {
-  font-weight: 500;
-  font-size: .5625rem;
-  letter-spacing: .2em;
-  text-transform: uppercase;
-  color: var(--ink-faint);
-}
-.lede {
-  color: var(--ink-muted);
-  max-width: 56ch;
-  margin-top: var(--s4);
-}
-
-section { border-top: 1px solid var(--line); padding-block: var(--section-y); overflow: clip; position: relative; }
-
-/* ── hero ───────────────────────────────── */
-.hero {
-  border-top: none;
-  padding: calc(56px + var(--s6)) 0 var(--s7);
-  position: relative;
-}
-.hero__grid { display: grid; grid-template-columns: 1fr; gap: var(--s6); }
-.hero__grid > *, .two > *, .entry > * { min-width: 0; }
-.hero h1 {
-  font-family: var(--f-mono);
-  font-weight: 400;
-  font-size: clamp(1.75rem, 1rem + 4.4vw, 3.4rem);
-  letter-spacing: -.02em;
-  line-height: 1;
-  color: var(--ink);
-}
-.hero__live {
-  display: inline-flex; align-items: center; gap: var(--s2);
-  margin-bottom: var(--s4);
-}
-.dot {
-  width: 6px; height: 6px; border-radius: 50%;
-  background: var(--bone);
-  animation: blink 1.5s infinite;
-}
-@keyframes blink { 0%,48% { opacity: 1 } 60%,to { opacity: .18 } }
-.regfield {
-  position: absolute;
-  inset: 0;
-  background-image: radial-gradient(var(--line) 1px, transparent 1.3px);
-  background-size: 22px 22px;
-  opacity: .5;
-  pointer-events: none;
-  mask-image: radial-gradient(120% 80% at 82% 30%, #000 15%, transparent 65%);
-  -webkit-mask-image: radial-gradient(120% 80% at 82% 30%, #000 15%, transparent 65%);
-}
-
-/* ── spec table ─────────────────────────── */
-.spec { margin-top: var(--s6); max-width: 520px; }
-.spec__row {
-  display: flex; align-items: baseline; gap: var(--s3);
-  padding: var(--s2) 0;
-  border-bottom: 1px solid var(--line-soft);
-}
-.spec__k {
-  font-weight: 500;
-  font-size: .6875rem;
-  letter-spacing: .14em;
-  text-transform: uppercase;
-  color: var(--ink-muted);
-  flex-shrink: 0;
-}
-.spec__lead { flex: 1; border-bottom: 1px dotted var(--line-soft); transform: translateY(-.28em); }
-.spec__v {
-  font-family: var(--f-mono);
-  font-size: .8rem;
-  color: var(--ink);
-  flex-shrink: 0;
-}
-
-/* ── code readout ───────────────────────── */
-.readout {
-  background: var(--paper-raised);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: clamp(var(--s3), 3vw, var(--s4));
-  font-family: var(--f-mono);
-  font-size: clamp(.69rem, .63rem + .3vw, .76rem);
-  line-height: 1.7;
-  color: var(--ink-dim);
-  max-width: 100%;
-  overflow-x: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.prompt { color: var(--ink-faint); user-select: none; }
-.comment { color: var(--ink-faint); }
-.hl { color: var(--ink); }
-
-/* ── ascii diagram: scroll, never reflow ── */
-.readout--tree {
-  white-space: pre;
-  word-break: normal;
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
-  scrollbar-width: thin;
-  scrollbar-color: var(--line) transparent;
-}
-.readout--tree::-webkit-scrollbar { height: 4px; }
-.readout--tree::-webkit-scrollbar-thumb { background: var(--line); }
-
-/* ── rotating sample name ───────────────── */
-.readout--rows { white-space: normal; display: grid; gap: var(--s4); }
-.rl { display: grid; gap: 2px; min-width: 0; }
-.rl__cmd {
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  padding-left: 2ch;
-  text-indent: -2ch;
-  min-width: 0;
-}
-.rl .comment { order: -1; }
-.rot {
-  display: inline-block;
-  text-indent: 0;
-  text-align: left;
-  color: var(--bone);
-}
-.rot__t { display: inline-block; }
-
-/* The fade is also the clock: the script swaps the name on this animation's
-   iteration boundary, where opacity is 0, so the change is never seen. */
-.rot.is-live .rot__t { animation: rotFade 3s linear infinite; }
-@keyframes rotFade {
-  0%   { opacity: 0; transform: translateY(.35em) }
-  9%   { opacity: 1; transform: translateY(0) }
-  91%  { opacity: 1; transform: translateY(0) }
-  100% { opacity: 0; transform: translateY(-.35em) }
-}
-
-/* ── scripts ────────────────────────────── */
-.entry {
-  border-bottom: 1px solid var(--line-soft);
-  padding: var(--s6) 0;
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: var(--s4);
-}
-.entry:last-of-type { border-bottom: none; padding-bottom: 0; }
-.entry > * { min-width: 0; }
-.entry__head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s4); flex-wrap: wrap; }
-.entry__idx {
-  font-family: var(--f-mono);
-  font-size: .5625rem;
-  letter-spacing: .1em;
-  text-transform: uppercase;
-  color: var(--ink-faint);
-  margin-bottom: var(--s2);
-}
-.entry__name {
-  font-family: var(--f-display);
-  font-size: clamp(1.5rem, 1.1rem + 1.6vw, 2.1rem);
-  color: var(--ink);
-}
-.entry__meta { font-family: var(--f-mono); font-size: .7rem; color: var(--ink-faint); text-align: left; overflow-wrap: anywhere; }
-.entry__note { color: var(--ink-muted); max-width: 62ch; }
-.cmd {
-  display: flex; align-items: stretch; gap: 0;
-  flex-direction: column;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--paper-raised);
-  transition: border-color var(--move);
-  min-width: 0;
-}
-.cmd:hover { border-color: var(--line-strong); }
-.cmd__text {
-  flex: 1;
-  min-width: 0;
-  padding: var(--s3) clamp(var(--s3), 3vw, var(--s4));
-  font-family: var(--f-mono);
-  font-size: clamp(.69rem, .63rem + .3vw, .76rem);
-  color: var(--ink);
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  padding-left: calc(clamp(var(--s3), 3vw, var(--s4)) + 2ch);
-  text-indent: -2ch;
-}
-.cmd__btn {
-  flex-shrink: 0;
-  border: none;
-  border-top: 1px solid var(--line);
-  background: transparent;
-  color: var(--ink-muted);
-  font-family: var(--f-sans);
-  font-weight: 500;
-  font-size: .625rem;
-  letter-spacing: .12em;
-  text-transform: uppercase;
-  padding: var(--s3) var(--s4);
-  text-align: right;
-  cursor: pointer;
-  transition: background var(--move), color var(--move);
-}
-.cmd__btn:hover { background: var(--tint5); color: var(--ink); }
-.cmd__btn.done { color: var(--bone); }
-.entry__links { display: flex; gap: var(--s5); flex-wrap: wrap; }
-.glink {
-  font-weight: 500;
-  font-size: .625rem;
-  letter-spacing: .14em;
-  text-transform: uppercase;
-  color: var(--ink-muted);
-  text-decoration: none;
-  position: relative;
-  transition: color var(--move);
-}
-.glink:after {
-  content: "";
-  position: absolute;
-  left: 0; bottom: -3px;
-  width: 100%; height: 1px;
-  background: currentColor;
-  transform: scaleX(0);
-  transform-origin: left;
-  transition: transform var(--move) var(--ease-out);
-}
-.glink:hover { color: var(--ink); }
-.glink:hover:after { transform: scaleX(1); }
-.empty { color: var(--ink-faint); font-family: var(--f-mono); font-size: .8rem; }
-
-/* ── plate with corner ticks ────────────── */
-.plate {
-  position: relative;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: clamp(var(--s4), 4vw, var(--s6));
-  background: var(--paper-raised);
-  min-width: 0;
-}
-.tick { position: absolute; width: 12px; height: 12px; pointer-events: none; }
-.tick:before, .tick:after { content: ""; position: absolute; background: var(--ink-faint); }
-.tick:before { left: 0; top: 50%; width: 100%; height: 1px; }
-.tick:after { top: 0; left: 50%; height: 100%; width: 1px; }
-.tick--tl { top: 6px; left: 6px; }
-.tick--tr { top: 6px; right: 6px; }
-.tick--bl { bottom: 6px; left: 6px; }
-.tick--br { bottom: 6px; right: 6px; }
-
-/* ── two column ─────────────────────────── */
-.two { display: grid; grid-template-columns: 1fr; gap: var(--s7); }
-.stmt {
-  font-family: var(--f-sans);
-  font-size: clamp(1.2rem, 1rem + 1.4vw, 1.8rem);
-  font-weight: 400;
-  letter-spacing: -.01em;
-  line-height: 1.2;
-  color: var(--ink);
-  max-width: 26ch;
-}
-.notes { display: grid; gap: var(--s5); }
-.note__k { margin-bottom: var(--s1); }
-.note p { color: var(--ink-muted); font-size: .92rem; }
-
-/* ── footer ─────────────────────────────── */
-.ftr { border-top: 1px solid var(--line); padding-top: var(--s7); overflow: clip; }
-.ftr__word {
-  font-family: var(--f-display);
-  font-size: clamp(4rem, 22vw, 15rem);
-  line-height: .8;
-  color: transparent;
-  -webkit-text-stroke: 1px var(--line);
-  text-align: center;
-  user-select: none;
-  margin-bottom: calc(var(--s5) * -1);
-}
-.ftr__bar {
-  border-top: 1px solid var(--line-soft);
-  margin-top: var(--s6);
-  padding: var(--s4) 0 var(--s6);
-  display: flex; justify-content: space-between; gap: var(--s4);
-  flex-wrap: wrap;
-  font-family: var(--f-mono);
-  font-size: .625rem;
-  letter-spacing: .1em;
-  text-transform: uppercase;
-  color: var(--ink-faint);
-}
-.ftr__bar a { text-decoration: none; transition: color var(--move); }
-.ftr__bar a:hover { color: var(--ink); }
-
-@media (min-width: 660px) {
-  .readout--rows { gap: var(--s2); }
-  .rl { display: flex; align-items: baseline; gap: var(--s5); }
-  .rl__cmd { padding-left: 0; text-indent: 0; }
-  .rl .comment { order: 0; margin-left: auto; white-space: nowrap; flex-shrink: 0; }
-  .rot { min-width: var(--rotw); }
-  .entry__meta { text-align: right; }
-  .cmd { flex-direction: row; align-items: stretch; }
-  .cmd__text {
-    white-space: nowrap;
-    overflow-x: auto;
-    padding-left: var(--s4);
-    text-indent: 0;
-    scrollbar-width: none;
-  }
-  .cmd__text::-webkit-scrollbar { display: none; }
-  .cmd__btn { border-top: none; border-left: 1px solid var(--line); padding: 0 var(--s4); }
-}
-
-@media (min-width: 780px) {
-  .hero__grid { grid-template-columns: 1.15fr .85fr; align-items: start; gap: var(--s8); }
-  .entry { grid-template-columns: 1fr; }
-  .two { grid-template-columns: .95fr 1.05fr; }
-}
-
-/* No blanket animation reset: every animation here is either information
-   (the rotating name) or a small, slow cue, so all of them keep running.
-   Only instant scrolling is honoured, which is what actually causes trouble. */
-@media (prefers-reduced-motion: reduce) {
-  html { scroll-behavior: auto; }
-
-  .rot.is-live .rot__t { animation: rotFade 3s linear infinite !important; }
-  .dot { animation: blink 1.5s infinite !important; }
-}
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..600&amp;family=Space+Grotesk:wght@400;500&amp;family=Space+Mono:wght@400;700&amp;display=swap" rel="stylesheet">
+<style nonce="${safeNonce}">
+:root{--paper:#000;--raised:#0a0a0a;--ink:#cdc4ba;--dim:#b0a9a0;--muted:#958f87;--faint:#7a756e;--line:rgba(205,196,186,.26);--soft:rgba(205,196,186,.13);--strong:rgba(205,196,186,.42);--tint:rgba(205,196,186,.05);--display:"Fraunces",Georgia,serif;--sans:"Space Grotesk",system-ui,sans-serif;--mono:"Space Mono",ui-monospace,monospace;--max:1080px;--wide:1440px;--gutter:clamp(1.15rem,4vw,3rem);--section:clamp(2.5rem,6vw,4.75rem);--move:.17s;--ease:cubic-bezier(.215,.61,.355,1)}
+*{box-sizing:border-box;margin:0;padding:0}html{color-scheme:dark;scroll-behavior:smooth}html,body{width:100%;max-width:100%;overflow-x:clip}body{background:var(--paper);color:var(--dim);font:clamp(.94rem,.9rem + .18vw,1rem)/1.65 var(--sans);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}body:before{content:"";position:fixed;inset:0;z-index:9999;pointer-events:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='256' height='256'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.82' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='256' height='256' filter='url(%23n)'/%3E%3C/svg%3E");opacity:.055}::selection{background:var(--ink);color:var(--paper)}a{color:inherit}button{font:inherit}h1,h2,h3{color:var(--ink);font-family:var(--display);font-weight:400;letter-spacing:-.01em;line-height:1;text-wrap:balance}.wrap{width:100%;max-width:var(--max);margin-inline:auto;padding-inline:var(--gutter)}.wide{width:100%;max-width:var(--wide);margin-inline:auto;padding-inline:var(--gutter)}.mono{font-family:var(--mono)}.hdr{position:fixed;z-index:100;inset:0 0 auto;height:56px;display:flex;align-items:center;border-bottom:1px solid transparent;transition:background var(--move),border-color var(--move)}.hdr.solid{background:rgba(0,0,0,.9);backdrop-filter:blur(8px);border-color:var(--line)}.hdr__in{display:flex;align-items:center;justify-content:space-between;gap:1rem}.logo{display:flex;gap:.5rem;align-items:baseline;color:var(--ink);text-decoration:none}.logo__t{font:clamp(.65rem,.55rem + .5vw,.75rem) var(--mono);color:var(--muted)}.nav{display:flex;align-items:center;gap:clamp(.9rem,3vw,1.5rem)}.nav a,.motion{font-size:.625rem;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);background:none;border:0;text-decoration:none;cursor:pointer}.nav a:hover,.motion:hover{color:var(--ink)}:where(a,button):focus-visible{outline:2px solid var(--ink);outline-offset:4px;border-radius:2px}.hero{position:relative;padding:calc(56px + 2.5rem) 0 3.5rem}.hero:after{content:"";position:absolute;inset:0;pointer-events:none;background-image:radial-gradient(var(--line) 1px,transparent 1.3px);background-size:22px 22px;opacity:.45;mask-image:radial-gradient(100% 75% at 84% 25%,#000 10%,transparent 70%)}.hero__grid{position:relative;z-index:1;display:grid;grid-template-columns:1fr;gap:2rem}.eyebrow{display:flex;align-items:center;gap:.75rem;margin-bottom:1.5rem;color:var(--muted);font-size:.66rem;font-weight:500;letter-spacing:.22em;text-transform:uppercase}.eyebrow:after{content:"";height:1px;flex:1;background:var(--line)}.eyebrow__k{color:var(--ink);font:.9rem var(--display);letter-spacing:0}.live{display:inline-flex;align-items:center;gap:.5rem;margin-bottom:1rem}.dot{width:6px;height:6px;border-radius:50%;background:var(--ink);animation:blink 1.5s infinite}.micro,.label{font-size:.625rem;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}h1{font:400 clamp(1.75rem,1rem + 4.4vw,3.4rem)/1 var(--mono)}.lede{max-width:58ch;margin-top:1rem;color:var(--muted)}.spec{max-width:540px;margin-top:2rem}.spec__row{display:flex;align-items:baseline;gap:.75rem;padding:.5rem 0;border-bottom:1px solid var(--soft)}.spec__k{font-size:.6875rem;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}.spec__lead{flex:1;border-bottom:1px dotted var(--soft);transform:translateY(-.28em)}.spec__v{font:.76rem var(--mono);color:var(--ink);overflow-wrap:anywhere}.readout,.cmd{background:var(--raised);border:1px solid var(--line);border-radius:2px}.readout{padding:clamp(.75rem,3vw,1rem);font:clamp(.7rem,.65rem + .25vw,.78rem)/1.75 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}.usage-label{margin-bottom:.75rem}.usage-note{margin-top:1rem;line-height:1.8}.prompt,.comment{color:var(--faint)}.hl{color:var(--ink)}section:not(.hero){position:relative;padding-block:var(--section);border-top:1px solid var(--line)}section[id]{scroll-margin-top:72px}.stmt{max-width:28ch;font:400 clamp(1.25rem,1rem + 1.4vw,1.85rem)/1.2 var(--sans);margin-bottom:2rem}.entry{display:grid;gap:1rem;padding:2rem 0;border-bottom:1px solid var(--soft)}.entry:last-child{border-bottom:0;padding-bottom:0}.entry__head{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;flex-wrap:wrap}.entry__idx{margin-bottom:.5rem;font:.5625rem var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}.entry__name{font-size:clamp(1.5rem,1.1rem + 1.6vw,2.1rem)}.entry__meta{font:.7rem/1.65 var(--mono);color:var(--faint);overflow-wrap:anywhere}.entry__note{max-width:65ch;color:var(--muted)}.hash{font:.67rem/1.65 var(--mono);color:var(--faint);overflow-wrap:anywhere}.cmd{display:flex;flex-direction:column;min-width:0;transition:border-color var(--move)}.cmd:hover{border-color:var(--strong)}.cmd__text{min-width:0;padding:.85rem 1rem;font:clamp(.68rem,.63rem + .25vw,.75rem)/1.7 var(--mono);color:var(--ink);white-space:pre-wrap;overflow-wrap:anywhere}.cmd__btn{padding:.75rem 1rem;border:0;border-top:1px solid var(--line);background:transparent;color:var(--muted);font-size:.625rem;font-weight:500;letter-spacing:.12em;text-transform:uppercase;text-align:right;cursor:pointer}.cmd__btn:hover{background:var(--tint);color:var(--ink)}.copy-status{min-height:1.25em;color:var(--muted);font-size:.72rem}.links{display:flex;gap:1.5rem;flex-wrap:wrap}.glink{position:relative;color:var(--muted);font-size:.625rem;font-weight:500;letter-spacing:.14em;text-transform:uppercase;text-decoration:none}.glink:after{content:"";position:absolute;left:0;bottom:-3px;width:100%;height:1px;background:currentColor;transform:scaleX(0);transform-origin:left;transition:transform var(--move) var(--ease)}.glink:hover{color:var(--ink)}.glink:hover:after{transform:scaleX(1)}.two{display:grid;grid-template-columns:1fr;gap:3rem}.notes{display:grid;gap:1.5rem}.note p:last-child{color:var(--muted);font-size:.94rem}.note .label{margin-bottom:.25rem}.plate{position:relative;padding:clamp(1rem,4vw,2rem);border:1px solid var(--line);background:var(--raised)}.plate .stmt{margin-bottom:1.5rem}.readout--rows{display:grid;gap:.75rem;margin-top:1.5rem}.rot{display:inline-block;min-width:10ch;color:var(--ink)}.rot__t{display:inline-block}.rot.is-live .rot__t{animation:rotFade 3s linear infinite}.motion-off .rot.is-live .rot__t,.motion-off .dot{animation:none}.ftr{padding-top:3rem;border-top:1px solid var(--line);overflow:clip}.ftr__word{margin-bottom:-1.5rem;color:transparent;font:clamp(4rem,22vw,15rem)/.8 var(--display);text-align:center;-webkit-text-stroke:1px var(--line);user-select:none}.ftr__bar{display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-top:2rem;padding:1rem 0 1.5rem;border-top:1px solid var(--soft);font:.625rem var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}.ftr__bar a{text-decoration:none}.ftr__bar a:hover{color:var(--ink)}
+@keyframes blink{0%,48%{opacity:1}60%,to{opacity:.18}}@keyframes blinkReduced{0%,48%{opacity:1}60%,to{opacity:.45}}@keyframes rotFade{0%{opacity:0;transform:translateY(.35em)}9%,91%{opacity:1;transform:translateY(0)}100%{opacity:0;transform:translateY(-.35em)}}@keyframes rotFadeReduced{0%,100%{opacity:.25}12%,88%{opacity:1}}
+@media(max-width:420px){.nav a[href^="https"]{display:none}.nav{gap:.75rem}}
+@media(min-width:660px){.cmd{flex-direction:row}.cmd__text{flex:1;white-space:nowrap;overflow-x:auto}.cmd__btn{border-top:0;border-left:1px solid var(--line);text-align:center}.entry__meta{text-align:right}}
+@media(min-width:780px){.hero__grid{grid-template-columns:1.15fr .85fr;align-items:start;gap:4rem}.two{grid-template-columns:.95fr 1.05fr}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.rot.is-live .rot__t{animation-name:rotFadeReduced}.dot{animation-name:blinkReduced}.motion-on .rot.is-live .rot__t{animation-name:rotFade}.motion-on .dot{animation-name:blink}}
+.motion-off .rot.is-live .rot__t{animation-name:rotFadeReduced}.motion-off .dot{animation:none}
 </style>
 </head>
 <body>
-
-<header class="hdr" id="hdr">
-  <div class="wrap-wide hdr__in">
-    <a class="logo" href="/">
-      <span class="logo__k">源</span>
-      <span class="logo__t">${DOMAIN}</span>
-    </a>
-    <div class="hdr__right">
-      <a class="hdr-link" href="#scripts">Scripts</a>
-      <a class="hdr-link" href="https://github.com/${REPO}">Source</a>
-    </div>
-  </div>
-</header>
-
+<header class="hdr" id="hdr"><div class="wide hdr__in"><a class="logo" href="/"><span>源</span><span class="logo__t">${DOMAIN}</span></a><nav class="nav" aria-label="Primary"><a href="#scripts">Tools</a><a href="https://github.com/${REPO}">Source</a><button class="motion" id="motion" type="button" aria-pressed="true">Motion: on</button></nav></div></header>
 <main>
-  <section class="hero">
-    <div class="regfield"></div>
-    <div class="wrap hero__grid">
-      <div>
-        <p class="eyebrow"><span class="eyebrow__k">源</span> Script index</p>
-        <div class="hero__live">
-          <span class="dot"></span>
-          <span class="micro">Serving from the edge</span>
-        </div>
-        <h1>${DOMAIN}</h1>
-        <p class="lede">Shell scripts from <span class="mono">${REPO}</span>, mirrored at the Cloudflare edge. Push to <span class="mono">${BRANCH}</span> and the file is live one curl later. No build step, no release tags.</p>
-
-        <div class="spec">
-          ${specRow("Source", REPO)}
-          ${specRow("Branch", BRANCH)}
-          ${specRow("Files", String(files.length).padStart(2, "0"))}
-          ${specRow("Payload", fmtSize(total))}
-          ${specRow("Edge cache", CACHE_TTL / 60 + " min")}
-        </div>
-      </div>
-
-      <div>
-        <p class="label" style="margin-bottom:var(--s3)">Usage</p>
-        <div class="readout"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/</span><span class="comment">&lt;file&gt;</span><span class="hl"> | sh</span></div>
-        <p class="micro" style="margin-top:var(--s4);line-height:1.8">Every path below <span class="mono">/</span> maps straight onto the repository root.</p>
-      </div>
-    </div>
-  </section>
-
-  <section id="scripts">
-    <div class="wrap">
-      <p class="eyebrow"><span class="eyebrow__k">具</span> Published</p>
-      <h2 class="stmt" style="margin-bottom:var(--s6)">Everything on the branch, one curl away.</h2>
-      ${rows}
-    </div>
-  </section>
-
-  <section id="how">
-    <div class="wrap two">
-      <div>
-        <p class="eyebrow"><span class="eyebrow__k">道</span> How it works</p>
-        <h2 class="stmt">The repository is the deployment.</h2>
-      </div>
-      <div class="notes">
-        <div class="readout readout--tree">GET https://${DOMAIN}/<span class="comment">&lt;file&gt;</span>
-  <span class="comment">│</span>
-  <span class="comment">├─</span> edge cache hit  <span class="comment">→ served, 0 hops</span>
-  <span class="comment">└─</span> miss
-       <span class="comment">└─</span> raw.githubusercontent.com/${REPO}/${BRANCH}/<span class="comment">&lt;file&gt;</span>
-            <span class="comment">└─</span> cached ${CACHE_TTL / 60} min, then served</div>
-        <div class="note">
-          <p class="label note__k">No deploy step</p>
-          <p>Commit a file to <span class="mono">${BRANCH}</span> and it is published under its own name. Nothing to rebuild, nothing to register, nothing to invalidate by hand.</p>
-        </div>
-        <div class="note">
-          <p class="label note__k">Cached at the edge</p>
-          <p>A hit never touches GitHub, so rate limits stay clear and a GitHub outage does not take the cached copy down. Changes land within ${CACHE_TTL / 60} minutes.</p>
-        </div>
-        <div class="note">
-          <p class="label note__k">Describe it in meta.json</p>
-          <p>Optional. Add an entry keyed by filename and the index above picks up the title, note and target on the next fetch.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section id="care">
-    <div class="wrap">
-      <p class="eyebrow"><span class="eyebrow__k">見</span> Before you pipe</p>
-      <div class="plate">
-        <span class="tick tick--tl"></span><span class="tick tick--tr"></span>
-        <span class="tick tick--bl"></span><span class="tick tick--br"></span>
-        <h2 class="stmt" style="margin-bottom:var(--s5)">Read it before you run it.</h2>
-        <p class="entry__note">Piping a URL into a shell hands it your machine. These scripts are mine and they are short on purpose — open the file, read it end to end, then decide. Drop the pipe to inspect first:</p>
-        <div class="readout readout--rows" style="margin-top:var(--s5);--rotw:${sampleWidth}ch"><span class="rl"><span class="rl__cmd"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/</span>${rotate}</span><span class="comment"># print it</span></span>
-<span class="rl"><span class="rl__cmd"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/</span>${rotate.replace('id="rot"', 'id="rot2"')}<span class="hl"> | sh</span></span><span class="comment"># then run it</span></span></div>
-      </div>
-    </div>
-  </section>
+<section class="hero"><div class="wrap hero__grid"><div><p class="eyebrow"><span class="eyebrow__k">源</span> Verified tool index</p><div class="live"><span class="dot" aria-hidden="true"></span><span class="micro">Serving from the edge</span></div><h1>${DOMAIN}</h1><p class="lede">A small, explicit allowlist from <span class="mono">${REPO}</span>. Every displayed tool is fetched at one commit, hashed at the edge, and offered through an immutable version URL.</p><div class="spec">${specRow("Source", REPO)}${specRow("Commit", commit)}${specRow("Tools", String(files.length).padStart(2, "0"))}${specRow("Payload", fmtSize(total))}${specRow("Edge cache", `${CACHE_TTL / 60} min`)}</div></div><div><p class="label usage-label">Verified use</p><div class="readout"><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/v/${commit}/</span><span class="rot" id="rot"><span class="rot__t">${sample}</span></span></div><p class="micro usage-note">Pin the commit. Check the SHA-256. Read the file. Then run it.</p></div></div></section>
+<section id="scripts"><div class="wrap"><p class="eyebrow"><span class="eyebrow__k">具</span> Published</p><h2 class="stmt">Manifest-listed tools, verified one commit at a time.</h2>${rows}</div></section>
+<section id="how"><div class="wrap two"><div><p class="eyebrow"><span class="eyebrow__k">道</span> Trust path</p><h2 class="stmt">The manifest is the boundary, not a directory listing.</h2></div><div class="notes"><div class="readout">GET /v/${commit}/<span class="comment">&lt;name&gt;</span>
+  <span class="comment">├─</span> validate public route
+  <span class="comment">├─</span> load manifest at the same commit
+  <span class="comment">├─</span> fetch its declared tools/<span class="comment">&lt;name&gt;</span> source
+  <span class="comment">└─</span> serve text with immutable caching</div><div class="note"><p class="label">No free proxy</p><p>Repository paths, subdirectories, hidden files, and names outside the local allowlist are never forwarded upstream.</p></div><div class="note"><p class="label">Pinned and inspectable</p><p>The command downloads one immutable version, checks its displayed digest, prints it for inspection, asks for confirmation, and cleans up its temporary file.</p></div></div></div></section>
+<section id="care"><div class="wrap"><p class="eyebrow"><span class="eyebrow__k">見</span> Before you run</p><div class="plate"><h2 class="stmt">Read it before you trust it.</h2><p class="entry__note">A checksum proves that the download matches this page. It does not prove that a script is safe for your machine. Read every line and understand the requested privileges.</p><div class="readout readout--rows"><span><span class="prompt">$ </span><span class="hl">curl -fsSL https://${DOMAIN}/v/${commit}/</span><span class="rot" id="rot2"><span class="rot__t">${sample}</span></span></span><span class="comment"># pin, verify, inspect, confirm, run</span></div></div></div></section>
 </main>
-
-<footer class="ftr">
-  <div class="wrap-wide">
-    <div class="ftr__word">RAW</div>
-    <div class="ftr__bar">
-      <span>One source of truth · ${REPO}</span>
-      <a href="https://github.com/${REPO}">github.com/${REPO} ↗</a>
-      <span>源 · ${DOMAIN}</span>
-    </div>
-  </div>
-</footer>
-
-<script>
+<footer class="ftr"><div class="wide"><div class="ftr__word" aria-hidden="true">RAW</div><div class="ftr__bar"><span>One explicit manifest · ${REPO}</span><a href="https://github.com/${REPO}">github.com/${REPO} ↗</a><span>源 · ${DOMAIN}</span></div></div></footer>
+<script nonce="${safeNonce}">
 document.documentElement.classList.remove("no-js");
-
-const hdr = document.getElementById("hdr");
-const onScroll = () => hdr.classList.toggle("solid", window.scrollY > 8);
-onScroll();
-addEventListener("scroll", onScroll, { passive: true });
-
-document.querySelectorAll("[data-copy]").forEach(btn => {
-  btn.addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(btn.dataset.copy);
-      const prev = btn.textContent;
-      btn.textContent = "Copied";
-      btn.classList.add("done");
-      setTimeout(() => { btn.textContent = prev; btn.classList.remove("done"); }, 1400);
-    } catch {}
-  });
-});
-
-const rotNames = ${JSON.stringify(names).replace(/</g, "\\u003c")};
-const rots = ["rot", "rot2"].map(id => document.getElementById(id)).filter(Boolean);
-if (rots.length && rotNames.length > 1) {
-  const texts = rots.map(r => r.querySelector(".rot__t"));
-  let i = 0;
-
-  // The fade's own iteration boundary is the clock — no separate timer to
-  // drift against. At that instant opacity is 0, so replacing the name there
-  // is never visible.
-  texts[0].addEventListener("animationiteration", () => {
-    i = (i + 1) % rotNames.length;
-    texts.forEach(t => { t.textContent = rotNames[i]; });
-  });
-
-  rots.forEach(r => r.classList.add("is-live"));
-}
+const hdr=document.getElementById("hdr");const onScroll=()=>hdr.classList.toggle("solid",scrollY>8);onScroll();addEventListener("scroll",onScroll,{passive:true});
+const motion=document.getElementById("motion");const applyMotion=value=>{document.documentElement.classList.toggle("motion-off",value==="off");document.documentElement.classList.toggle("motion-on",value==="on");motion.setAttribute("aria-pressed",String(value!=="off"));motion.textContent=value==="off"?"Motion: off":"Motion: on"};let motionValue=null;try{motionValue=localStorage.getItem("raw-motion")}catch(error){console.warn("Motion preference unavailable",error)}applyMotion(motionValue);motion.addEventListener("click",()=>{motionValue=motionValue==="off"?"on":"off";try{localStorage.setItem("raw-motion",motionValue)}catch(error){console.warn("Motion preference could not be saved",error)}applyMotion(motionValue)});
+document.querySelectorAll("[data-copy]").forEach(button=>{button.addEventListener("click",async()=>{const status=document.getElementById(button.getAttribute("aria-describedby"));try{await navigator.clipboard.writeText(button.dataset.copy);button.textContent="Copied";status.textContent="Command copied to the clipboard.";setTimeout(()=>{button.textContent="Copy"},1400)}catch{button.textContent="Copy failed";status.textContent="Copy failed. Select and copy the command manually."}})});
+const names=${JSON.stringify(names).replace(/</g, "\\u003c")};const rots=["rot","rot2"].map(id=>document.getElementById(id)).filter(Boolean);if(rots.length&&names.length>1){const texts=rots.map(node=>node.querySelector(".rot__t"));let index=0;texts[0].addEventListener("animationiteration",()=>{index=(index+1)%names.length;texts.forEach(node=>{node.textContent=names[index]})});rots.forEach(node=>node.classList.add("is-live"))}
 </script>
 </body>
 </html>`;
 }
 
-function scriptEntry(file, i, notes) {
+function scriptEntry(file, index, commit) {
   const name = esc(file.name);
-  const meta = (notes && notes[file.name]) || {};
-  const title = esc(meta.title || name);
-  const kanji = esc(meta.kanji || "・");
-  const note = esc(meta.note || `Served straight from ${REPO} at ${BRANCH}.`);
-  const target = meta.target ? esc(meta.target) : null;
-  const cmd = `curl -fsSL https://${DOMAIN}/${name} | sh`;
-  const idx = String(i).padStart(2, "0");
+  const title = esc(file.title);
+  const note = esc(file.note);
+  const target = esc(file.target.join(" · "));
+  const digest = esc(file.sha256);
+  const encodedName = encodeURIComponent(file.name);
+  const versionUrl = `https://${DOMAIN}/v/${commit}/${encodedName}`;
+  const command = secureCommand(versionUrl, file.sha256);
+  const statusId = `copy-status-${index}`;
+  const glyph = esc(file.kanji);
 
-  return `
-      <article class="entry">
-        <div>
-          <p class="entry__idx">${idx} // ${name.toUpperCase()}</p>
-          <div class="entry__head">
-            <h3 class="entry__name">${kanji} &nbsp;${title}</h3>
-            <p class="entry__meta">${fmtSize(file.size)}${target ? `<br>${target}` : ""}</p>
-          </div>
-        </div>
-        <p class="entry__note">${note}</p>
-        <div class="cmd">
-          <div class="cmd__text">${cmd}</div>
-          <button class="cmd__btn" data-copy="${cmd}" type="button">Copy</button>
-        </div>
-        <div class="entry__links">
-          <a class="glink" href="/${name}">View raw</a>
-          <a class="glink" href="https://github.com/${REPO}/blob/${BRANCH}/${name}">On GitHub ↗</a>
-        </div>
-      </article>`;
+  return `<article class="entry"><div><p class="entry__idx">${String(index).padStart(2, "0")} // ${esc(file.name.toUpperCase())}</p><div class="entry__head"><h3 class="entry__name">${glyph} &nbsp;${title}</h3><p class="entry__meta">${fmtSize(file.size)}<br>${target}</p></div></div><p class="entry__note">${note}</p><p class="hash"><span class="label">Commit</span> ${commit}<br><span class="label">SHA-256</span> ${digest}</p><div class="cmd"><code class="cmd__text">${esc(command)}</code><button class="cmd__btn" data-copy="${esc(command)}" aria-describedby="${statusId}" type="button">Copy</button></div><p class="copy-status" id="${statusId}" role="status" aria-live="polite"></p><div class="links"><a class="glink" href="https://github.com/${REPO}/blob/${commit}/${file.source.split("/").map(encodeURIComponent).join("/")}">View source ↗</a><a class="glink" href="/v/${commit}/${encodedName}">Download verified</a></div></article>`;
 }
 
-function specRow(k, v) {
-  return `<div class="spec__row">
-            <span class="spec__k">${k}</span>
-            <span class="spec__lead"></span>
-            <span class="spec__v tnum">${v}</span>
-          </div>`;
+function secureCommand(url, sha256) {
+  const quotedUrl = shellQuote(url);
+  return `tmp="$(mktemp)" && trap 'rm -f "$tmp"' EXIT HUP INT TERM && curl -fsSL ${quotedUrl} -o "$tmp" && printf '%s  %s\\n' '${sha256}' "$tmp" | sha256sum -c - && cat "$tmp" && printf '\\nRun this script? [y/N] ' && read -r answer && [ "$answer" = y ] && sh "$tmp"`;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'"'"'`)}'`;
+}
+
+function specRow(label, value) {
+  return `<div class="spec__row"><span class="spec__k">${esc(label)}</span><span class="spec__lead"></span><span class="spec__v">${esc(value)}</span></div>`;
 }
 
 function fmtSize(bytes) {
@@ -859,20 +448,38 @@ function fmtSize(bytes) {
   return `${(bytes / 1024).toFixed(1)} KB`;
 }
 
-function esc(s) {
-  return String(s)
+function esc(value) {
+  return String(value)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
 
-function guessType(path) {
-  if (path.endsWith(".json")) return "application/json";
-  if (path.endsWith(".js")) return "application/javascript";
-  if (path.endsWith(".html") || path.endsWith(".htm")) return "text/html";
-  if (path.endsWith(".css")) return "text/css";
-  if (path.endsWith(".sh")) return "text/plain";
-  if (path.endsWith(".md")) return "text/plain; charset=utf-8";
-  return "text/plain";
+function hex(buffer) {
+  return [...new Uint8Array(buffer)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function createNonce() {
+  const bytes = crypto.getRandomValues(new Uint8Array(18));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function isHead(request) {
+  return String(request.method || "GET").toUpperCase() === "HEAD";
+}
+
+function isPlainObject(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype);
+}
+
+function nonEmptyText(value, maxLength) {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength;
+}
+
+function positiveInteger(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : 0;
 }

@@ -1,0 +1,153 @@
+#!/usr/bin/env sh
+# essential tool: cinit
+# source: https://github.com/x-inu/essential/tree/main/tools
+set -eu
+
+log() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() {
+	printf 'error: %s\n' "$*" >&2
+	exit 1
+}
+usage() {
+	cat <<'EOF'
+Usage: cinit [--yes] [--dry-run]
+Disable cloud-init's flag, network rendering, and detected systemd units.
+  --yes      do not ask for confirmation
+  --dry-run  inspect and report without changing anything
+  --help     show this help
+EOF
+}
+
+YES=0
+DRY_RUN=0
+for ARG in "$@"; do
+	case "$ARG" in
+	--yes) YES=1 ;;
+	--dry-run) DRY_RUN=1 ;;
+	--help)
+		usage
+		exit 0
+		;;
+	*)
+		usage >&2
+		die "unknown option: $ARG"
+		;;
+	esac
+done
+
+ROOT=${ESSENTIAL_TEST_ROOT:-}
+case "$ROOT" in "" | /tmp/*) ;; *) die "invalid test root" ;; esac
+ETC=${ROOT}/etc
+CLOUD=$ETC/cloud
+CFG_DIR=$CLOUD/cloud.cfg.d
+FLAG=$CLOUD/cloud-init.disabled
+NETWORK=$CFG_DIR/99-disable-network-config.cfg
+BACKUP_PARENT=${ROOT}/var/backups
+network_disabled() {
+	[ -f "$NETWORK" ] && awk 'NR == 1 && $0 == "network: {config: disabled}" { found = 1; next } { found = 0 } END { exit !(found && NR == 1) }' "$NETWORK"
+}
+unit_state() {
+	STATE=$(systemctl is-enabled "$1.service" 2>/dev/null) || :
+	[ -n "$STATE" ] || STATE=unknown
+}
+
+if [ ! -d "$CLOUD" ]; then
+	log "cloud-init is not installed ($CLOUD is absent); nothing changed."
+	exit 0
+fi
+command -v systemctl >/dev/null 2>&1 || die "systemctl is required"
+command -v cloud-init >/dev/null 2>&1 || die "cloud-init executable is missing"
+
+UNITS=
+for UNIT in cloud-init-local cloud-init cloud-config cloud-final; do
+	if systemctl cat "$UNIT.service" >/dev/null 2>&1; then UNITS="$UNITS $UNIT"; fi
+done
+[ -n "$UNITS" ] || die "no cloud-init systemd units were detected"
+
+if [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+	SELF=$0
+	if [ ! -f "$SELF" ] || [ ! -r "$SELF" ] ||
+		! awk 'NR == 2 { ok = ($0 == "# essential tool: cinit") } END { exit !ok }' "$SELF"; then
+		die "cannot elevate piped input; save this script to a file and run it"
+	fi
+	if command -v sudo >/dev/null 2>&1; then
+		log "Requesting root with sudo..."
+		if sudo -v; then exec sudo /bin/sh "$SELF" "$@"; fi
+		warn "sudo elevation failed; trying su"
+	fi
+	command -v su >/dev/null 2>&1 || die "root is required and su is unavailable"
+	log "Enter the root password for su."
+	exec su -s /bin/sh root -- "$SELF" "$@"
+fi
+
+CHANGES=0
+[ -f "$FLAG" ] || CHANGES=1
+network_disabled || CHANGES=1
+for UNIT in $UNITS; do
+	unit_state "$UNIT"
+	[ "$STATE" = masked ] || CHANGES=1
+	if systemctl is-active --quiet "$UNIT.service"; then CHANGES=1; fi
+done
+
+if [ "$CHANGES" -eq 0 ]; then
+	log "Verified: cloud-init is already disabled; no changes or backup needed."
+	exit 0
+fi
+if [ "$DRY_RUN" -eq 1 ]; then
+	log "Dry run: changes are required for the flag, network policy, or detected units:$UNITS"
+	exit 0
+fi
+if [ "$YES" -eq 0 ]; then
+	printf 'Disable cloud-init and its network rendering? [y/N] '
+	if ! IFS= read -r ANSWER; then die "confirmation could not be read; cancelled"; fi
+	case "$ANSWER" in y | Y | yes | YES) ;; *) die "cancelled; nothing changed" ;; esac
+fi
+
+mkdir -p "$BACKUP_PARENT"
+BACKUP=$(mktemp -d "$BACKUP_PARENT/essential-cinit.XXXXXXXX")
+if [ -f "$FLAG" ]; then cp "$FLAG" "$BACKUP/cloud-init.disabled"; else touch "$BACKUP/cloud-init.disabled.absent"; fi
+if [ -f "$NETWORK" ]; then cp "$NETWORK" "$BACKUP/99-disable-network-config.cfg"; else touch "$BACKUP/network-config.absent"; fi
+printf '%s\n' "$UNITS" >"$BACKUP/detected-units"
+for UNIT in $UNITS; do
+	unit_state "$UNIT"
+	if systemctl is-active --quiet "$UNIT.service"; then ACTIVE=active; else ACTIVE=inactive; fi
+	printf '%s %s %s\n' "$UNIT" "$STATE" "$ACTIVE" >>"$BACKUP/unit-states"
+done
+
+mkdir -p "$CFG_DIR"
+touch "$FLAG"
+TEMP=$(mktemp "$CFG_DIR/.network.XXXXXX")
+trap 'rm -f "$TEMP"' EXIT HUP INT TERM
+printf 'network: {config: disabled}\n' >"$TEMP"
+chmod 0644 "$TEMP"
+mv "$TEMP" "$NETWORK"
+
+FAILURES=
+for UNIT in $UNITS; do
+	if systemctl disable --now "$UNIT.service"; then :; else FAILURES="$FAILURES $UNIT-disable"; fi
+	if systemctl mask "$UNIT.service"; then :; else FAILURES="$FAILURES $UNIT-mask"; fi
+done
+
+[ -f "$FLAG" ] || FAILURES="$FAILURES flag-verification"
+if ! network_disabled; then
+	FAILURES="$FAILURES network-verification"
+fi
+for UNIT in $UNITS; do
+	unit_state "$UNIT"
+	[ "$STATE" = masked ] || FAILURES="$FAILURES $UNIT-mask-verification"
+	if systemctl is-active --quiet "$UNIT.service"; then FAILURES="$FAILURES $UNIT-active-verification"; fi
+done
+
+if [ -n "$FAILURES" ]; then
+	warn "failed checks:$FAILURES"
+	warn "rollback: inspect $BACKUP, restore its files, then unmask/enable affected units"
+	warn "an .absent marker means remove the corresponding newly created file"
+	warn "example: systemctl unmask UNIT.service; systemctl enable --now UNIT.service"
+	exit 1
+fi
+
+log "Verified: disable flag exists and network rendering is disabled."
+log "Verified: detected units are masked and inactive:$UNITS"
+log "Backup: $BACKUP"
+log "Rollback: restore saved files (remove ones marked .absent), then unmask/enable required units."

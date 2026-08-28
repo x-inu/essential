@@ -1,0 +1,160 @@
+#!/usr/bin/env sh
+# essential tool: sudo
+# source: https://github.com/x-inu/essential/tree/main/tools
+set -eu
+
+die() { printf 'error: %s\n' "$*" >&2 && exit 1; }
+ROOT=${ESSENTIAL_TEST_ROOT:-}
+case "$ROOT" in "" | /tmp/*) ;; *) die "invalid test root" ;; esac
+PASSWD=${ROOT}/etc/passwd LOGIN_DEFS=${ROOT}/etc/login.defs SUDOERS=${ROOT}/etc/sudoers SUDOERS_D=${ROOT}/etc/sudoers.d
+validate_target() {
+	case "$1" in "" | -* | *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*) return 1 ;; esac
+	ENTRY=$(getent passwd "$1" 2>/dev/null) || return 1
+	TARGET_UID=$(printf '%s\n' "$ENTRY" | awk -F: 'NF >= 3 { print $3 }')
+	case "$TARGET_UID" in "" | *[!0123456789]*) return 1 ;; esac
+	[ "$TARGET_UID" -ge "$UID_MIN" ] && [ "$TARGET_UID" -le "$UID_MAX" ]
+}
+require_root() {
+	[ "$(id -u)" -ne 0 ] || return 0
+	SELF=$0
+	if [ ! -f "$SELF" ] || [ ! -r "$SELF" ] ||
+		! awk 'NR == 2 { ok = ($0 == "# essential tool: sudo") } END { exit !ok }' "$SELF"; then
+		die "cannot elevate piped input; save this script to a file and run it"
+	fi
+	if command -v sudo >/dev/null 2>&1; then
+		printf '%s\n' "Requesting root with sudo..."
+		if sudo -v; then exec sudo /bin/sh "$SELF" "$@"; fi
+		printf 'warning: sudo elevation failed; trying su\n' >&2
+	fi
+	command -v su >/dev/null 2>&1 || die "root is required and su is unavailable"
+	printf '%s\n' "Enter the root password for su."
+	exec su -s /bin/sh root -- "$SELF" "$@"
+}
+detect_target_user() {
+	[ -r "$PASSWD" ] || die "cannot read $PASSWD"
+	UID_MIN=1000 UID_MAX=60000
+	if [ -r "$LOGIN_DEFS" ]; then
+		VALUE=$(awk '$1 == "UID_MIN" { print $2; exit }' "$LOGIN_DEFS")
+		[ -z "$VALUE" ] || UID_MIN=$VALUE
+		VALUE=$(awk '$1 == "UID_MAX" { print $2; exit }' "$LOGIN_DEFS")
+		[ -z "$VALUE" ] || UID_MAX=$VALUE
+	fi
+	case "$UID_MIN:$UID_MAX" in *[!0123456789:]* | :* | *:) die "invalid UID_MIN/UID_MAX in $LOGIN_DEFS" ;; esac
+	[ "$UID_MIN" -le "$UID_MAX" ] || die "invalid UID_MIN/UID_MAX in $LOGIN_DEFS"
+	TARGET=
+	if [ "$#" -eq 1 ]; then
+		case "$1" in "" | -* | *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*) die "invalid user name: $1" ;; esac
+		validate_target "$1" || die "user '$1' is not a regular login account"
+		TARGET=$1
+		return
+	fi
+	for CANDIDATE in "${SUDO_USER:-}" "$(logname 2>/dev/null || :)"; do
+		case "$CANDIDATE" in "" | -* | *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*)
+			[ -z "$CANDIDATE" ] || die "invalid detected user name: $CANDIDATE"
+			continue
+			;;
+		esac
+		validate_target "$CANDIDATE" || continue
+		TARGET=$CANDIDATE
+		return
+	done
+	CANDIDATES=$(awk -F: -v lo="$UID_MIN" -v hi="$UID_MAX" \
+		'$3 >= lo && $3 <= hi && $1 != "nobody" { print $1 }' "$PASSWD")
+	COUNT=$(printf '%s\n' "$CANDIDATES" | awk 'NF { count++ } END { print count + 0 }')
+	case "$COUNT" in 0) die "no regular user found; specify one after creating it" ;; 1) ;; *) die "multiple regular users found; pass the target user explicitly" ;; esac
+	TARGET=$CANDIDATES
+	validate_target "$TARGET" || die "derived user '$TARGET' failed validation"
+}
+install_sudo() {
+	INSTALLED=no
+	PACKAGE_MANAGER="none (sudo already available)"
+	if ! command -v sudo >/dev/null 2>&1; then
+		if command -v apt-get >/dev/null 2>&1; then
+			PACKAGE_MANAGER=apt-get
+			export DEBIAN_FRONTEND=noninteractive
+			apt-get update -qq && apt-get install -y -qq sudo
+		elif command -v dnf >/dev/null 2>&1; then
+			PACKAGE_MANAGER=dnf
+			dnf install -y -q sudo
+		elif command -v pacman >/dev/null 2>&1; then
+			PACKAGE_MANAGER=pacman
+			pacman -S --needed sudo || die "pacman failed; update manually with 'pacman -Syu', then rerun"
+		elif command -v apk >/dev/null 2>&1; then
+			PACKAGE_MANAGER=apk
+			apk add --quiet sudo
+		else
+			die "supported package manager not found (apt-get, dnf, pacman, apk)"
+		fi
+		INSTALLED=yes
+	fi
+	command -v sudo >/dev/null 2>&1 || die "sudo is missing after package installation"
+	command -v visudo >/dev/null 2>&1 || die "visudo is missing after package installation"
+	OS_ID=$(awk -F= '$1 == "ID" { gsub(/"/, "", $2); print $2; exit }' "${ROOT}/etc/os-release")
+	case "$OS_ID" in alpine | arch | fedora | rhel | centos | rocky | almalinux) ADMIN_GROUP=wheel ;; *) ADMIN_GROUP=sudo ;; esac
+	if ! getent group "$ADMIN_GROUP" >/dev/null 2>&1; then
+		if [ "$OS_ID" = alpine ]; then addgroup -S "$ADMIN_GROUP"; else groupadd "$ADMIN_GROUP"; fi
+	fi
+}
+grant_admin_group() {
+	if ! id -nG "$TARGET" | tr ' ' '\n' | grep -qx "$ADMIN_GROUP"; then
+		if [ "$OS_ID" = alpine ]; then addgroup "$TARGET" "$ADMIN_GROUP"; else usermod -aG "$ADMIN_GROUP" "$TARGET"; fi
+	fi
+}
+install_sudoers_policy() {
+	POLICY_FOUND=
+	PATTERN="^%${ADMIN_GROUP}[[:space:]]+ALL[[:space:]]*=[[:space:]]*\\(ALL(:ALL)?\\)[[:space:]]+ALL([[:space:]]*#.*)?$"
+	INCLUDES_DIR=0
+	if grep -Eq '^[[:space:]]*[@#]includedir[[:space:]]+/etc/sudoers\.d([[:space:]]|$)' "$SUDOERS"; then
+		INCLUDES_DIR=1
+	fi
+	if [ -f "$SUDOERS" ] && grep -Eq "$PATTERN" "$SUDOERS"; then POLICY_FOUND=$SUDOERS; fi
+	if [ "$INCLUDES_DIR" -eq 1 ]; then
+		for FILE in "$SUDOERS_D"/*; do
+			[ -f "$FILE" ] || continue
+			case "${FILE##*/}" in *.* | *~) continue ;; esac
+			grep -Eq "$PATTERN" "$FILE" || continue
+			POLICY_FOUND=$FILE
+			break
+		done
+	fi
+	POLICY=$SUDOERS_D/90-essential-admin
+	if [ -n "$POLICY_FOUND" ]; then
+		visudo -c >/dev/null || die "existing sudoers configuration failed validation; nothing was changed"
+		return
+	fi
+	[ "$INCLUDES_DIR" -eq 1 ] || die "$SUDOERS does not include /etc/sudoers.d; add a validated @includedir before rerunning"
+	mkdir -p "$SUDOERS_D"
+	CANDIDATE=$(mktemp "$SUDOERS_D/.candidate.XXXXXX") STAGED=$(mktemp "$SUDOERS_D/.staged.XXXXXX") BACKUP=
+	trap 'rm -f "$CANDIDATE" "$STAGED" "$BACKUP"' EXIT HUP INT TERM
+	printf '%%%s ALL=(ALL:ALL) ALL\n' "$ADMIN_GROUP" >"$CANDIDATE"
+	chmod 0440 "$CANDIDATE"
+	visudo -cf "$CANDIDATE" >/dev/null || die "candidate sudoers policy failed validation"
+	if [ -f "$POLICY" ]; then
+		BACKUP=$(mktemp "$SUDOERS_D/.backup.XXXXXX")
+		cp -p "$POLICY" "$BACKUP"
+	fi
+	install -m 0440 "$CANDIDATE" "$STAGED"
+	mv "$STAGED" "$POLICY"
+	if ! visudo -c >/dev/null; then
+		if [ -n "$BACKUP" ]; then mv "$BACKUP" "$POLICY"; else rm -f "$POLICY"; fi
+		die "final sudoers validation failed; policy was rolled back"
+	fi
+	POLICY_FOUND=$POLICY
+}
+verify_installation() {
+	id -nG "$TARGET" | tr ' ' '\n' | grep -qx "$ADMIN_GROUP" || die "admin group membership verification failed"
+	printf '%s\n' "Package manager: $PACKAGE_MANAGER" "Target user: $TARGET" "Admin group: $ADMIN_GROUP" \
+		"sudo newly installed: $INSTALLED" "Sudoers validation: valid (${POLICY_FOUND##*/})" \
+		"Log out and back in, then run: sudo -v"
+}
+main() {
+	[ "$#" -le 1 ] || die "usage: sudo [USER]"
+	require_root "$@"
+	detect_target_user "$@"
+	install_sudo
+	install_sudoers_policy
+	grant_admin_group
+	verify_installation
+}
+
+main "$@"

@@ -1,14 +1,20 @@
 {
-  "cinit": {
-    "title": "Disable cloud-init",
-    "kanji": "止",
-    "note": "Stops cloud-init from reclaiming your network config on the next boot. Writes the disable flag, masks the four units, pins network config off.",
-    "target": "Debian · Ubuntu · any systemd host with /etc/cloud"
-  },
   "sudo": {
+    "source": "tools/sudo",
     "title": "Install sudo",
     "kanji": "権",
-    "note": "Installs sudo on a minimal box and puts your account in the admin group. Picks the user from the argument, then the login name, then the only regular account it finds — and refuses to guess when several exist. Elevates itself through su when sudo is not there yet, so it can be piped straight into sh.",
-    "target": "Debian · Ubuntu · Fedora · Arch · Alpine"
+    "note": "Installs sudo and safely grants administrative rights to an existing user.",
+    "target": ["debian", "ubuntu", "fedora", "arch", "alpine"],
+    "shell": "sh",
+    "requires_root": true
+  },
+  "cinit": {
+    "source": "tools/cinit",
+    "title": "Disable cloud-init",
+    "kanji": "止",
+    "note": "Safely disables cloud-init and preserves the previous network configuration.",
+    "target": ["debian", "ubuntu"],
+    "shell": "sh",
+    "requires_root": true
   }
 }

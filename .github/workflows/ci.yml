@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Linux checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+
+      - name: Install system test dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes dash python3 xz-utils
+
+      - name: Install pinned ShellCheck and shfmt
+        env:
+          SHELLCHECK_VERSION: 0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+          SHFMT_VERSION: 3.13.1
+          SHFMT_SHA256: fb096c5d1ac6beabbdbaa2874d025badb03ee07929f0c9ff67563ce8c75398b1
+        run: |
+          set -euo pipefail
+          install -d "$RUNNER_TEMP/bin"
+
+          shellcheck_archive="$RUNNER_TEMP/shellcheck.tar.xz"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+            -o "$shellcheck_archive"
+          printf '%s  %s\n' "$SHELLCHECK_SHA256" "$shellcheck_archive" | sha256sum -c -
+          tar -xJf "$shellcheck_archive" -C "$RUNNER_TEMP"
+          install -m 0755 \
+            "$RUNNER_TEMP/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" \
+            "$RUNNER_TEMP/bin/shellcheck"
+
+          shfmt_binary="$RUNNER_TEMP/shfmt"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/mvdan/sh/releases/download/v${SHFMT_VERSION}/shfmt_v${SHFMT_VERSION}_linux_amd64" \
+            -o "$shfmt_binary"
+          printf '%s  %s\n' "$SHFMT_SHA256" "$shfmt_binary" | sha256sum -c -
+          install -m 0755 "$shfmt_binary" "$RUNNER_TEMP/bin/shfmt"
+
+          printf '%s\n' "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+
+      - name: Report lint tool versions
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          shfmt --version
+
+      - name: Validate and lint tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find tools -maxdepth 1 -type f -print
+          mapfile -d '' -t tool_files < <(find tools -maxdepth 1 -type f -print0)
+          if (( ${#tool_files[@]} == 0 )); then
+            printf '%s\n' 'error: tools/ contains no files' >&2
+            exit 1
+          fi
+
+          for tool in "${tool_files[@]}"; do
+            if [[ ! -s "$tool" ]]; then
+              printf 'error: %s is empty\n' "$tool" >&2
+              exit 1
+            fi
+            if [[ ! -x "$tool" ]]; then
+              printf 'error: %s is not executable\n' "$tool" >&2
+              exit 1
+            fi
+          done
+
+          shellcheck tools/*
+          shfmt -d tools/*
+          for tool in "${tool_files[@]}"; do
+            dash -n "$tool"
+            bash -n "$tool"
+          done
+
+      - name: Check Worker syntax
+        run: node --check src/index.js
+
+      - name: Test Worker
+        run: node --test tests/worker.test.js
+
+      - name: Test POSIX tools
+        run: ./tests/run.sh
