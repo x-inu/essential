@@ -160,7 +160,7 @@ function render(files, notes) {
   const names = files.length ? files.map(f => f.name) : ["cinit"];
   const sample = esc(names[0]);
   const sampleWidth = Math.max(...names.map(n => n.length));
-  const rotate = `<span class="rot" id="rot"><span class="rot__t">${sample}</span></span>`;
+  const rotate = `<span class="rot" id="rot"><span class="rot__t">${sample}</span><span class="rot__bar"></span></span>`;
 
   const rows = files.length
     ? files.map((f, i) => scriptEntry(f, i, notes)).join("")
@@ -458,28 +458,39 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
   text-align: left;
   color: var(--bone);
 }
-.rot__t {
-  display: inline-block;
-  transition: opacity .26s var(--ease-out), transform .26s var(--ease-out);
-}
-.rot.is-out .rot__t { opacity: 0; transform: translateY(-.4em); }
-.rot.is-live:before,
-.rot.is-live:after {
-  content: "";
+.rot__t { display: inline-block; }
+.rot__bar { display: none; }
+
+/* The fade and the bar are both 3s and both start in the same style
+   recalculation, so the browser holds them on one phase — the bar reaching
+   its end is the same frame the name goes transparent, which is where the
+   script swaps the text. */
+.rot.is-live .rot__t { animation: rotFade 3s linear infinite; }
+.rot.is-live .rot__bar {
+  display: block;
   position: absolute;
   left: 0; bottom: -4px;
-  height: 1px;
-}
-.rot.is-live:before { right: 0; background: var(--line-soft); }
-.rot.is-live:after {
-  width: 100%;
+  width: 100%; height: 1px;
   background: var(--bone);
   opacity: .55;
   transform: scaleX(0);
   transform-origin: left;
   animation: rotTick 3s linear infinite;
 }
+.rot.is-live:before {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: -4px;
+  height: 1px;
+  background: var(--line-soft);
+}
 @keyframes rotTick { from { transform: scaleX(0) } to { transform: scaleX(1) } }
+@keyframes rotFade {
+  0%   { opacity: 0; transform: translateY(.35em) }
+  9%   { opacity: 1; transform: translateY(0) }
+  91%  { opacity: 1; transform: translateY(0) }
+  100% { opacity: 0; transform: translateY(-.35em) }
+}
 
 /* ── scripts ────────────────────────────── */
 .entry {
@@ -660,10 +671,10 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
 @media (prefers-reduced-motion: reduce) {
   *, *:before, *:after { animation: none !important; transition-duration: .001ms !important; }
 
-  /* The rotation carries meaning — it shows which names are published —
-     so keep it and its progress line running. */
-  .rot__t { transition-duration: .26s !important; }
-  .rot.is-live:after { animation: rotTick 3s linear infinite !important; }
+  /* The rotation is information, not decoration: it shows which names are
+     published, and its animation is also the clock that swaps the text. */
+  .rot.is-live .rot__t { animation: rotFade 3s linear infinite !important; }
+  .rot.is-live .rot__bar { animation: rotTick 3s linear infinite !important; }
 }
 </style>
 </head>
@@ -798,18 +809,20 @@ document.querySelectorAll("[data-copy]").forEach(btn => {
 const rotNames = ${JSON.stringify(names).replace(/</g, "\\u003c")};
 const rots = ["rot", "rot2"].map(id => document.getElementById(id)).filter(Boolean);
 if (rots.length && rotNames.length > 1) {
-  rots.forEach(r => r.classList.add("is-live"));
+  const texts = rots.map(r => r.querySelector(".rot__t"));
   let i = 0;
-  setInterval(() => {
+
+  // The fade and the bar are both 3s and both begin in the style
+  // recalculation that adding is-live triggers, so the browser keeps them on
+  // one phase — no timer to drift against. The bar's iteration boundary is
+  // therefore also the fade's, and that is the single frame where the name is
+  // transparent, so that is where it is swapped.
+  rots[0].querySelector(".rot__bar").addEventListener("animationiteration", () => {
     i = (i + 1) % rotNames.length;
-    rots.forEach(r => r.classList.add("is-out"));
-    setTimeout(() => {
-      rots.forEach(r => {
-        r.querySelector(".rot__t").textContent = rotNames[i];
-        r.classList.remove("is-out");
-      });
-    }, 260);
-  }, 3000);
+    texts.forEach(t => { t.textContent = rotNames[i]; });
+  });
+
+  rots.forEach(r => r.classList.add("is-live"));
 }
 </script>
 </body>
