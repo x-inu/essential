@@ -16,13 +16,11 @@ not a general-purpose GitHub proxy.
 
 ## Use
 
-Download a tool, read it, and run the same local file:
+Run a published tool from its direct route:
 
 ```sh
-curl -fsSL https://raw.xinu.my.id/cinit -o cinit
-cat cinit
-sh -n cinit
-sh cinit --dry-run
+curl -fsSL https://raw.xinu.my.id/cinit | sh
+curl -fsSL https://raw.xinu.my.id/sudo | sh
 ```
 
 For reproducible downloads, pin the full commit SHA:
@@ -31,12 +29,9 @@ For reproducible downloads, pin the full commit SHA:
 https://raw.xinu.my.id/v/<40-character-commit-SHA>/<tool>
 ```
 
-Check the SHA-256 shown on the [tool index](https://raw.xinu.my.id/) before
-running a pinned file. A matching checksum confirms the downloaded bytes, not
-that a script is safe for your machine.
-
-Do not use `curl | sh`. Both tools can make system-wide changes, so inspect
-their source and understand the requested privileges first.
+Both tools can make system-wide changes. Review their source and understand the
+requested privileges before running them. The direct commands require a shell
+that already has the necessary privileges.
 
 ## Verify
 

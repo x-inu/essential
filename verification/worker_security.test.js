@@ -433,7 +433,7 @@ test("fetchTool computes SHA-256 over exact bytes", async (t) => {
   assert.equal(result.sha256, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 });
 
-test("index uses one commit for manifest, tools, routes, links, hashes, and secure commands", async (t) => {
+test("index uses one commit and shows simple direct commands for every tool", async (t) => {
   const calls = [];
   const restore = installFetch(async (url) => {
     calls.push(url);
@@ -449,11 +449,12 @@ test("index uses one commit for manifest, tools, routes, links, hashes, and secu
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-security-policy"), /script-src 'nonce-[A-Za-z0-9_-]+'/);
   assert.match(response.headers.get("content-security-policy"), /style-src 'nonce-[A-Za-z0-9_-]+'/);
-  assert.match(html, new RegExp(`/v/${SHA}/sudo`));
-  assert.match(html, /sha256sum -c -/);
-  assert.match(html, /mktemp/);
-  assert.match(html, /trap 'rm -f/);
-  assert.match(html, /read -r answer/);
+  assert.match(html, /href="\/sudo">Download latest/);
+  assert.match(html, /curl -fsSL https:\/\/raw\.xinu\.my\.id\/cinit \| sh/);
+  assert.match(html, /curl -fsSL https:\/\/raw\.xinu\.my\.id\/sudo \| sh/);
+  assert.doesNotMatch(html, /sha256sum -c -/);
+  assert.doesNotMatch(html, /mktemp/);
+  assert.doesNotMatch(html, /read -r answer/);
   assert.match(html, new RegExp(`github\\.com/x-inu/essential/blob/${SHA}/tools/sudo`));
   assert.match(html, /aria-live="polite"/);
   assert.match(html, /Copy failed/);
@@ -492,7 +493,7 @@ test("index escapes manifest HTML and safely encodes route segments", async (t) 
   assert.match(html, /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/);
   assert.match(html, /Ampersand &amp; quote &quot; and &lt;script&gt;/);
   assert.match(html, /target-all/);
-  assert.match(html, new RegExp(`/v/${OTHER_SHA}/cinit`));
+  assert.match(html, /href="\/cinit">Download latest/);
 });
 
 test("favicon is local, hardened, GET/HEAD only", async () => {
