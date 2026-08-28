@@ -454,8 +454,8 @@ test("index uses one commit and shows simple direct commands for every tool", as
   assert.match(html, /curl -fsSL https:\/\/raw\.xinu\.my\.id\/sudo \| sh/);
   assert.match(html, /id="rot2"/);
   assert.match(html, /id="rot3"/);
-  assert.match(html, /# read it/);
-  assert.match(html, /# run it/);
+  assert.match(html, /# print it/);
+  assert.match(html, /# then run it/);
   assert.doesNotMatch(html, /sha256sum -c -/);
   assert.doesNotMatch(html, /mktemp/);
   assert.doesNotMatch(html, /read -r answer/);
