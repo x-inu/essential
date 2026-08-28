@@ -160,7 +160,7 @@ function render(files, notes) {
   const names = files.length ? files.map(f => f.name) : ["cinit"];
   const sample = esc(names[0]);
   const sampleWidth = Math.max(...names.map(n => n.length));
-  const rotate = `<span class="rot" id="rot"><span class="rot__t">${sample}</span><span class="rot__bar"></span></span>`;
+  const rotate = `<span class="rot" id="rot"><span class="rot__t">${sample}</span></span>`;
 
   const rows = files.length
     ? files.map((f, i) => scriptEntry(f, i, notes)).join("")
@@ -453,38 +453,15 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
 .rl .comment { order: -1; }
 .rot {
   display: inline-block;
-  position: relative;
   text-indent: 0;
   text-align: left;
   color: var(--bone);
 }
 .rot__t { display: inline-block; }
-.rot__bar { display: none; }
 
-/* The fade and the bar are both 3s and both start in the same style
-   recalculation, so the browser holds them on one phase — the bar reaching
-   its end is the same frame the name goes transparent, which is where the
-   script swaps the text. */
+/* The fade is also the clock: the script swaps the name on this animation's
+   iteration boundary, where opacity is 0, so the change is never seen. */
 .rot.is-live .rot__t { animation: rotFade 3s linear infinite; }
-.rot.is-live .rot__bar {
-  display: block;
-  position: absolute;
-  left: 0; bottom: -4px;
-  width: 100%; height: 1px;
-  background: var(--bone);
-  opacity: .55;
-  transform: scaleX(0);
-  transform-origin: left;
-  animation: rotTick 3s linear infinite;
-}
-.rot.is-live:before {
-  content: "";
-  position: absolute;
-  left: 0; right: 0; bottom: -4px;
-  height: 1px;
-  background: var(--line-soft);
-}
-@keyframes rotTick { from { transform: scaleX(0) } to { transform: scaleX(1) } }
 @keyframes rotFade {
   0%   { opacity: 0; transform: translateY(.35em) }
   9%   { opacity: 1; transform: translateY(0) }
@@ -674,7 +651,6 @@ section { border-top: 1px solid var(--line); padding-block: var(--section-y); ov
   /* The rotation is information, not decoration: it shows which names are
      published, and its animation is also the clock that swaps the text. */
   .rot.is-live .rot__t { animation: rotFade 3s linear infinite !important; }
-  .rot.is-live .rot__bar { animation: rotTick 3s linear infinite !important; }
 }
 </style>
 </head>
@@ -812,12 +788,10 @@ if (rots.length && rotNames.length > 1) {
   const texts = rots.map(r => r.querySelector(".rot__t"));
   let i = 0;
 
-  // The fade and the bar are both 3s and both begin in the style
-  // recalculation that adding is-live triggers, so the browser keeps them on
-  // one phase — no timer to drift against. The bar's iteration boundary is
-  // therefore also the fade's, and that is the single frame where the name is
-  // transparent, so that is where it is swapped.
-  rots[0].querySelector(".rot__bar").addEventListener("animationiteration", () => {
+  // The fade's own iteration boundary is the clock — no separate timer to
+  // drift against. At that instant opacity is 0, so replacing the name there
+  // is never visible.
+  texts[0].addEventListener("animationiteration", () => {
     i = (i + 1) % rotNames.length;
     texts.forEach(t => { t.textContent = rotNames[i]; });
   });
