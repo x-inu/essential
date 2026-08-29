@@ -16,5 +16,14 @@
     "target": ["debian", "ubuntu"],
     "shell": "sh",
     "requires_root": true
+  },
+  "inet": {
+    "source": "tools/inet",
+    "title": "Configure network",
+    "kanji": "網",
+    "note": "Safely configures IPv4, gateway, DNS, route metric, and MTU with automatic rollback.",
+    "target": ["debian", "ubuntu"],
+    "shell": "sh",
+    "requires_root": true
   }
 }

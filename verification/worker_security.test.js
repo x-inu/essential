@@ -14,23 +14,32 @@ const SHA = "0123456789abcdef0123456789abcdef01234567";
 const OTHER_SHA = "89abcdef0123456789abcdef0123456789abcdef";
 const manifest = {
   cinit: {
-      source: "tools/cinit",
-      title: "Disable cloud-init",
-      kanji: "止",
-      note: "Stop cloud-init safely.",
-      target: ["debian", "ubuntu"],
-      shell: "sh",
-      requires_root: true,
-    },
+    source: "tools/cinit",
+    title: "Disable cloud-init",
+    kanji: "止",
+    note: "Stop cloud-init safely.",
+    target: ["debian", "ubuntu"],
+    shell: "sh",
+    requires_root: true,
+  },
+  inet: {
+    source: "tools/inet",
+    title: "Configure network",
+    kanji: "網",
+    note: "Configure networking safely.",
+    target: ["debian", "ubuntu"],
+    shell: "sh",
+    requires_root: true,
+  },
   sudo: {
-      source: "tools/sudo",
-      title: "Install sudo",
-      kanji: "権",
-      note: "Install sudo safely.",
-      target: ["debian", "ubuntu", "fedora", "arch", "alpine"],
-      shell: "sh",
-      requires_root: true,
-    },
+    source: "tools/sudo",
+    title: "Install sudo",
+    kanji: "権",
+    note: "Install sudo safely.",
+    target: ["debian", "ubuntu", "fedora", "arch", "alpine"],
+    shell: "sh",
+    requires_root: true,
+  },
 };
 
 const manifestTools = Object.entries(manifest).map(([name, item]) => ({
@@ -52,23 +61,32 @@ test("checked-in meta.json is the exact explicit allowlist", async () => {
   );
   assert.deepEqual(checkedIn, {
     sudo: {
-        source: "tools/sudo",
-        title: "Install sudo",
-        kanji: "権",
-        note: "Installs sudo and safely grants administrative rights to an existing user.",
-        target: ["debian", "ubuntu", "fedora", "arch", "alpine"],
-        shell: "sh",
-        requires_root: true,
-      },
+      source: "tools/sudo",
+      title: "Install sudo",
+      kanji: "権",
+      note: "Installs sudo and safely grants administrative rights to an existing user.",
+      target: ["debian", "ubuntu", "fedora", "arch", "alpine"],
+      shell: "sh",
+      requires_root: true,
+    },
     cinit: {
-        source: "tools/cinit",
-        title: "Disable cloud-init",
-        kanji: "止",
-        note: "Safely disables cloud-init and preserves the previous network configuration.",
-        target: ["debian", "ubuntu"],
-        shell: "sh",
-        requires_root: true,
-      },
+      source: "tools/cinit",
+      title: "Disable cloud-init",
+      kanji: "止",
+      note: "Safely disables cloud-init and preserves the previous network configuration.",
+      target: ["debian", "ubuntu"],
+      shell: "sh",
+      requires_root: true,
+    },
+    inet: {
+      source: "tools/inet",
+      title: "Configure network",
+      kanji: "網",
+      note: "Safely configures IPv4, gateway, DNS, route metric, and MTU with automatic rollback.",
+      target: ["debian", "ubuntu"],
+      shell: "sh",
+      requires_root: true,
+    },
   });
 });
 
@@ -115,7 +133,7 @@ async function body(response) {
 }
 
 test("strict public names and source paths accept only the allowlist shape", () => {
-  for (const name of ["sudo", "cinit", "a-b", "a_b", "a.b", "a1"]) {
+  for (const name of ["sudo", "cinit", "inet", "a-b", "a_b", "a.b", "a1"]) {
     assert.equal(validatePublicName(name), true, name);
   }
   for (const name of ["", ".sudo", "sudo/now", "SUDO", "sudo%2fnow", "sudo;id", "-sudo", "sudo-"]) {
@@ -123,6 +141,7 @@ test("strict public names and source paths accept only the allowlist shape", () 
   }
   assert.equal(validateSourcePath("tools/sudo", "sudo"), true);
   assert.equal(validateSourcePath("tools/cinit", "cinit"), true);
+  assert.equal(validateSourcePath("tools/inet", "inet"), true);
   for (const source of ["sudo", "/tools/sudo", "tools//sudo", "tools/sudo/x", "tools/../sudo", "tools/%73udo", "tools\\sudo"]) {
     assert.equal(validateSourcePath(source, "sudo"), false, source);
   }
@@ -131,6 +150,7 @@ test("strict public names and source paths accept only the allowlist shape", () 
 test("resolveTool supports direct and exact version routes only", () => {
   assert.deepEqual(resolveTool("/sudo"), { name: "sudo", ref: "main", versioned: false });
   assert.deepEqual(resolveTool(`/v/${SHA}/cinit`), { name: "cinit", ref: SHA, versioned: true });
+  assert.deepEqual(resolveTool("/inet"), { name: "inet", ref: "main", versioned: false });
   for (const path of [
     "/tools/sudo",
     "/src/index.js",
@@ -440,6 +460,7 @@ test("index uses one commit and shows simple direct commands for every tool", as
     if (url.includes("/commits/main")) return json({ sha: SHA });
     if (url.endsWith(`/${SHA}/meta.json`)) return json(manifest);
     if (url.endsWith(`/${SHA}/tools/cinit`)) return toolBody("cinit");
+    if (url.endsWith(`/${SHA}/tools/inet`)) return toolBody("inet");
     if (url.endsWith(`/${SHA}/tools/sudo`)) return toolBody("sudo");
     throw new Error(`unexpected ${url}`);
   });
@@ -451,6 +472,7 @@ test("index uses one commit and shows simple direct commands for every tool", as
   assert.match(response.headers.get("content-security-policy"), /style-src 'nonce-[A-Za-z0-9_-]+'/);
   assert.match(html, /href="\/sudo">Download latest/);
   assert.match(html, /curl -fsSL https:\/\/raw\.xinu\.my\.id\/cinit \| sh/);
+  assert.match(html, /curl -fsSL https:\/\/raw\.xinu\.my\.id\/inet \| sh/);
   assert.match(html, /curl -fsSL https:\/\/raw\.xinu\.my\.id\/sudo \| sh/);
   assert.match(html, /id="rot2"/);
   assert.match(html, /id="rot3"/);
@@ -486,6 +508,7 @@ test("index uses one commit and shows simple direct commands for every tool", as
     "https://api.github.com/repos/x-inu/essential/commits/main",
     `https://raw.githubusercontent.com/x-inu/essential/${SHA}/meta.json`,
     `https://raw.githubusercontent.com/x-inu/essential/${SHA}/tools/cinit`,
+    `https://raw.githubusercontent.com/x-inu/essential/${SHA}/tools/inet`,
     `https://raw.githubusercontent.com/x-inu/essential/${SHA}/tools/sudo`,
   ]);
 });

@@ -13,6 +13,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 SUDO_TOOL = REPO / "tools" / "sudo"
 CINIT_TOOL = REPO / "tools" / "cinit"
+INET_TOOL = REPO / "tools" / "inet"
 
 DISPATCHER = r'''#!/bin/sh
 set -eu
@@ -68,6 +69,107 @@ addgroup)
   if [ "${1:-}" != -S ]; then printf '%s %s\n' "${MOCK_GROUPS:-users}" "$2" >"$state/$1.groups"; fi
   ;;
 cloud-init) : ;;
+netplan)
+  action=${1:-}; shift || :
+  case "$action" in
+  generate)
+    [ -z "${MOCK_NETPLAN_GENERATE_DELAY:-}" ] || /bin/sleep "$MOCK_NETPLAN_GENERATE_DELAY"
+    [ "${MOCK_NETPLAN_GENERATE_FAIL:-0}" = 0 ]
+    ;;
+  apply|try)
+    [ "${MOCK_NETPLAN_APPLY_FAIL:-0}" = 0 ] || exit 1
+    if [ "${MOCK_NETPLAN_SKIP_RUNTIME:-0}" = 0 ]; then
+      cfg="$root/etc/netplan/99-essential-inet.yaml"
+      [ -f "$cfg" ] || cfg="$root/etc/netplan/10-base.yaml"
+      iface=$(awk '/^    [a-zA-Z0-9_.:-]+:$/ { n=$1; sub(/:$/, "", n); print n; exit }' "$cfg")
+      address=$(awk '/^        - [0-9]+\./ { print $2; exit }' "$cfg")
+      gateway=$(awk '$1 == "via:" { print $2; exit }' "$cfg")
+      mtu=$(awk '$1 == "mtu:" { print $2; exit }' "$cfg")
+      metric=$(awk '$1 == "metric:" || $1 == "route-metric:" { print $2; exit }' "$cfg")
+      if [ "$cfg" = "$root/etc/netplan/10-base.yaml" ]; then address="${MOCK_ORIGINAL_ADDRESS:-192.0.2.10/24}"; gateway="${MOCK_ORIGINAL_GATEWAY:-192.0.2.1}"; fi
+      [ -n "$address" ] || address="${MOCK_DHCP_ADDRESS:-192.0.2.20/24}"
+      [ -n "$gateway" ] || gateway="${MOCK_DHCP_GATEWAY:-192.0.2.1}"
+      printf '%s\n' "$address" >"$state/$iface.addresses"
+      printf '%s\n' "$gateway" >"$state/$iface.gateway"
+      [ -z "$mtu" ] || printf '%s\n' "$mtu" >"$state/$iface.mtu"
+      [ -z "$metric" ] || printf '%s\n' "$metric" >"$state/$iface.metric"
+    fi
+    [ -z "${MOCK_NETPLAN_APPLY_DELAY:-}" ] || /bin/sleep "$MOCK_NETPLAN_APPLY_DELAY"
+    ;;
+  *) exit 2 ;;
+  esac
+  ;;
+ifquery)
+  [ "${MOCK_IFQUERY_FAIL:-0}" = 0 ]
+  ;;
+ifreload|ifup)
+  [ "${MOCK_IF_APPLY_FAIL:-0}" = 0 ] || exit 1
+  iface=""; for value in "$@"; do case "$value" in -*) ;; *) iface=$value ;; esac; done
+  [ -n "$iface" ] || iface="${MOCK_IFACE:-ens18}"
+  cfg="$root/etc/network/interfaces"
+  [ -f "$root/etc/network/interfaces.d/99-essential-inet" ] && cfg="$root/etc/network/interfaces.d/99-essential-inet"
+  address=$(awk -v target="$iface" '$1 == "iface" && $2 == target { active=1; next } active && $1 == "address" { print $2; exit } active && /^[^[:space:]]/ { exit }' "$cfg")
+  [ -n "$address" ] || address="${MOCK_DHCP_ADDRESS:-192.0.2.20/24}"
+  printf '%s\n' "$address" >"$state/$iface.addresses"
+  gateway=$(awk -v target="$iface" '$1 == "iface" && $2 == target { active=1; next } active && $1 == "gateway" { print $2; exit } active && /^[^[:space:]]/ { exit }' "$cfg")
+  metric=$(awk -v target="$iface" '$1 == "iface" && $2 == target { active=1; next } active && $1 == "metric" { print $2; exit } active && /^[^[:space:]]/ { exit }' "$cfg")
+  mtu=$(awk -v target="$iface" '$1 == "iface" && $2 == target { active=1; next } active && $1 == "mtu" { print $2; exit } active && /^[^[:space:]]/ { exit }' "$cfg")
+  [ -n "$gateway" ] || gateway="${MOCK_DHCP_GATEWAY:-192.0.2.1}"
+  printf '%s\n' "$gateway" >"$state/$iface.gateway"
+  [ -z "$metric" ] || printf '%s\n' "$metric" >"$state/$iface.metric"
+  [ -z "$mtu" ] || printf '%s\n' "$mtu" >"$state/$iface.mtu"
+  ;;
+ifdown) : ;;
+resolvconf) : ;;
+nohup) exec "$@" ;;
+sleep) /bin/sleep "$@" ;;
+date) printf '2026-08-29T00:00:00Z\n' ;;
+od) printf '0123456789abcdef0123456789abcdef0123456789abcdef\n' ;;
+stat)
+  if [ "$1" = -c ]; then /usr/bin/stat "$@"; else exit 2; fi
+  ;;
+chown) : ;;
+kill) /bin/kill "$@" ;;
+nmcli)
+  printf 'GENERAL.STATE:100 (connected)\nGENERAL.CONNECTION:mock\n'
+  ;;
+ip)
+  if [ "${1:-}" = -d ]; then shift; fi
+  if [ "${1:-}" = -o ] && [ "${2:-}" = link ] && [ "${3:-}" = show ]; then
+    shift 3
+    if [ "${1:-}" = dev ]; then
+      iface=$2; [ -f "$state/$iface.exists" ] || exit 1
+      mtu=$(cat "$state/$iface.mtu" 2>/dev/null || printf 1500)
+      status=$(cat "$state/$iface.state" 2>/dev/null || printf UP)
+      mac=$(cat "$state/$iface.mac" 2>/dev/null || printf '02:00:00:00:00:01')
+      printf '2: %s: <BROADCAST,MULTICAST,UP> mtu %s state %s mode DEFAULT group default qlen 1000 link/ether %s brd ff:ff:ff:ff:ff:ff\n' "$iface" "$mtu" "$status" "$mac"
+    else
+      for file in "$state"/*.exists; do
+        [ -f "$file" ] || continue; iface=${file##*/}; iface=${iface%.exists}
+        printf '2: %s: <BROADCAST,MULTICAST,UP> mtu 1500 state UP mode DEFAULT group default qlen 1000 link/ether 02:00:00:00:00:01 brd ff:ff:ff:ff:ff:ff\n' "$iface"
+      done
+    fi
+    exit 0
+  fi
+  if [ "${1:-}" = -o ] && [ "${2:-}" = -4 ] && [ "${3:-}" = addr ] && [ "${4:-}" = show ]; then
+    iface=$6; addresses=$(cat "$state/$iface.addresses" 2>/dev/null || :)
+    n=2; for address in $addresses; do printf '%s: %s    inet %s scope global %s\n' "$n" "$iface" "$address" "$iface"; n=$((n+1)); done
+    exit 0
+  fi
+  if [ "${1:-}" = -4 ] && [ "${2:-}" = route ] && [ "${3:-}" = show ] && [ "${4:-}" = default ]; then
+    iface=""; [ "${5:-}" = dev ] && iface=$6
+    for file in "$state"/*.gateway; do
+      [ -f "$file" ] || continue; item=${file##*/}; item=${item%.gateway}; [ -z "$iface" ] || [ "$iface" = "$item" ] || continue
+      gateway=$(cat "$file"); [ -n "$gateway" ] || continue; metric=$(cat "$state/$item.metric" 2>/dev/null || :)
+      printf 'default via %s dev %s%s\n' "$gateway" "$item" "${metric:+ metric $metric}"
+    done
+    exit 0
+  fi
+  if [ "${1:-}" = -4 ] && [ "${2:-}" = route ] && [ "${3:-}" = show ] && [ "${4:-}" = dev ]; then
+    iface=$5; gateway=$(cat "$state/$iface.gateway" 2>/dev/null || :); [ -z "$gateway" ] || printf 'default via %s dev %s\n' "$gateway" "$iface"; exit 0
+  fi
+  exit 2
+  ;;
 systemctl)
   action=$1; shift
   case "$action" in
@@ -144,6 +246,11 @@ class ToolCase(unittest.TestCase):
         }
 
     def tearDown(self):
+        token_file = self.root / "run/essential-inet/lock/token"
+        if token_file.is_file():
+            token = token_file.read_text().strip()
+            if len(token) == 48:
+                self.run_tool(INET_TOOL, "--confirm", token)
         self.temp.cleanup()
 
     def mock(self, name):
@@ -177,6 +284,29 @@ class ToolCase(unittest.TestCase):
             (self.state / f"{unit}.enabled").write_text(enabled)
             (self.state / f"{unit}.active").write_text(active)
         return {"MOCK_UNITS": units}
+
+    def init_net(self, distro="ubuntu", backend="netplan", address="192.0.2.10/24", secondary=""):
+        for command in ("ip", "stat", "chown", "date", "od", "nohup", "sleep", "kill"):
+            self.mock(command)
+        (self.state / "ens18.exists").touch()
+        (self.state / "ens18.state").write_text("UP")
+        (self.state / "ens18.mac").write_text("02:00:00:00:00:18")
+        (self.state / "ens18.mtu").write_text("1500")
+        (self.state / "ens18.addresses").write_text("\n".join(filter(None, (address, secondary))) + "\n")
+        (self.state / "ens18.gateway").write_text("192.0.2.1")
+        (self.root / "etc/os-release").write_text(f"ID={distro}\nVERSION_ID=12\n")
+        (self.root / "sys/class/net/ens18").mkdir(parents=True)
+        if backend == "netplan":
+            self.mock("netplan")
+            netplan = self.root / "etc/netplan"
+            netplan.mkdir(parents=True)
+            (netplan / "10-base.yaml").write_text("network:\n  version: 2\n  ethernets:\n    ens18:\n      dhcp4: true\n")
+        elif backend == "ifupdown":
+            for command in ("ifquery", "ifreload", "ifup", "ifdown", "resolvconf"):
+                self.mock(command)
+            network = self.root / "etc/network"
+            network.mkdir(parents=True)
+            (network / "interfaces").write_text("auto ens18\niface ens18 inet dhcp\n")
 
 
 class SudoTests(ToolCase):
@@ -424,9 +554,279 @@ class CinitTests(ToolCase):
         self.assertNotIn("Verified:", failed.stdout)
 
 
+class InetTests(ToolCase):
+    STATIC = (
+        "--interface", "ens18", "--mode", "static",
+        "--address", "192.0.2.50/24", "--gateway", "192.0.2.1",
+        "--dns", "1.1.1.1,8.8.8.8", "--metric", "100", "--mtu", "1500",
+    )
+
+    def test_help_and_show_need_no_root(self):
+        help_result = self.run_tool(INET_TOOL, "--help", MOCK_EUID="1000")
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("--rollback", help_result.stdout)
+        self.init_net()
+        shown = self.run_tool(INET_TOOL, "--show", MOCK_EUID="1000")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertIn("ens18", shown.stdout)
+        self.assertIn("netplan", shown.stdout)
+        self.assertIn("yes", shown.stdout)
+
+    def test_detects_ubuntu_netplan_and_static_dry_run_without_writes(self):
+        self.init_net()
+        before = {p.relative_to(self.root): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        result = self.run_tool(INET_TOOL, "--dry-run", *self.STATIC)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Backend: netplan", result.stdout)
+        self.assertIn("routes:", result.stdout)
+        self.assertIn("metric: 100", result.stdout)
+        after = {p.relative_to(self.root): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        self.assertEqual(after, before)
+        self.assertFalse((self.root / "var/backups").exists())
+        self.assertNotIn("netplan <apply>", self.log.read_text())
+
+    def test_detects_debian_ifupdown_and_dhcp_dry_run(self):
+        self.init_net(distro="debian", backend="ifupdown")
+        result = self.run_tool(INET_TOOL, "--dry-run", "--interface", "ens18", "--mode", "dhcp", "--mtu", "1400")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Backend: ifupdown", result.stdout)
+        self.assertIn("iface ens18 inet dhcp", result.stdout)
+        self.assertIn("mtu 1400", result.stdout)
+
+        metric = self.run_tool(INET_TOOL, "--dry-run", "--interface", "ens18", "--mode", "dhcp", "--metric", "42")
+        self.assertEqual(metric.returncode, 0, metric.stderr)
+        self.assertIn("metric 42", metric.stdout)
+
+        (self.root / "etc/network/interfaces").write_text(
+            "auto ens18\niface ens18 inet static\n    address 192.0.2.10/24\n    gateway 192.0.2.1\n"
+        )
+        applied = self.run_tool(INET_TOOL, "--interface", "ens18", "--mode", "dhcp", "--yes", SSH_CONNECTION="client")
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual((self.state / "ens18.addresses").read_text().strip(), "192.0.2.20/24")
+
+    def test_rejects_ambiguous_and_networkmanager_backends(self):
+        self.init_net()
+        network = self.root / "etc/network"
+        network.mkdir(parents=True)
+        (network / "interfaces").write_text("auto ens18\niface ens18 inet dhcp\n")
+        ambiguous = self.run_tool(INET_TOOL, "--dry-run", *self.STATIC)
+        self.assertNotEqual(ambiguous.returncode, 0)
+        self.assertIn("ambiguous", ambiguous.stderr)
+        (network / "interfaces").unlink()
+        self.mock("nmcli")
+        nm = self.run_tool(INET_TOOL, "--dry-run", *self.STATIC)
+        self.assertNotEqual(nm.returncode, 0)
+        self.assertIn("NetworkManager", nm.stderr)
+
+    def test_validation_rejects_bad_values_and_gateway_outside_subnet(self):
+        self.init_net()
+        cases = [
+            (("--address", "999.1.1.1/24"), "invalid IPv4/CIDR"),
+            (("--address", "192.0.2.50/33"), "invalid IPv4/CIDR"),
+            (("--gateway", "192.0.3.1"), "outside"),
+            (("--dns", "1.1.1.999"), "invalid DNS"),
+            (("--metric", "-1"), "metric"),
+            (("--mtu", "500"), "MTU"),
+            (("--mtu", "999999999999999999999999"), "MTU"),
+            (("--metric", "999999999999999999999999"), "metric"),
+            (("--interface", "bad/name"), "invalid interface"),
+        ]
+        for replacement, message in cases:
+            args = list(self.STATIC)
+            option, value = replacement
+            index = args.index(option)
+            args[index + 1] = value
+            with self.subTest(option=option, value=value):
+                result = self.run_tool(INET_TOOL, "--dry-run", *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+    def test_secondary_ipv4_is_preserved_and_other_interface_untouched(self):
+        self.init_net(secondary="192.0.2.11/24")
+        source = self.root / "etc/netplan/10-base.yaml"
+        source.write_text("network:\n  version: 2\n  ethernets:\n    ens18:\n      dhcp4: true\n      dhcp6: true\n    ens19:\n      dhcp4: true\n")
+        result = self.run_tool(INET_TOOL, "--dry-run", *self.STATIC)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("192.0.2.11/24", result.stdout)
+        self.assertEqual(source.read_text(), "network:\n  version: 2\n  ethernets:\n    ens18:\n      dhcp4: true\n      dhcp6: true\n    ens19:\n      dhcp4: true\n")
+
+        managed = self.root / "etc/netplan/99-essential-inet.yaml"
+        managed.write_text("network:\n  version: 2\n  ethernets:\n    ens19:\n      dhcp4: true\n")
+        refused = self.run_tool(INET_TOOL, "--dry-run", *self.STATIC)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("manages another interface", refused.stderr)
+
+    def test_static_apply_creates_backup_absent_marker_and_atomic_file(self):
+        self.init_net()
+        result = self.run_tool(INET_TOOL, *self.STATIC, "--yes", SSH_CONNECTION="client")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        managed = self.root / "etc/netplan/99-essential-inet.yaml"
+        self.assertTrue(managed.exists())
+        self.assertEqual(stat.S_IMODE(managed.stat().st_mode), 0o600)
+        self.assertFalse(list(managed.parent.glob(".essential-inet.*")))
+        backup = next((self.root / "var/backups").iterdir())
+        self.assertTrue((backup / "config.absent").exists())
+        self.assertTrue((backup / "rollback").exists())
+        self.assertIn("essential-inet-backup: 1", (backup / "manifest").read_text())
+        self.assertIn("Confirm with:", result.stdout)
+        token = (self.root / "run/essential-inet/lock/token").read_text().strip()
+        self.assertEqual(len(token), 48)
+
+    def test_existing_managed_file_is_backed_up_and_idempotent_run_skips_backup(self):
+        self.init_net()
+        managed = self.root / "etc/netplan/99-essential-inet.yaml"
+        original = "network:\n  version: 2\n  ethernets:\n    ens18:\n      dhcp4: true\n      addresses: []\n"
+        managed.write_text(original)
+        managed.chmod(0o640)
+        first = self.run_tool(INET_TOOL, *self.STATIC, "--yes", SSH_CONNECTION="client")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        backup = next((self.root / "var/backups").iterdir())
+        self.assertEqual((backup / "old-config").read_text(), original)
+        token = (self.root / "run/essential-inet/lock/token").read_text().strip()
+        confirm = self.run_tool(INET_TOOL, "--confirm", token)
+        self.assertEqual(confirm.returncode, 0, confirm.stderr)
+        count = len(list((self.root / "var/backups").iterdir()))
+        second = self.run_tool(INET_TOOL, *self.STATIC, "--yes", SSH_CONNECTION="client")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("already present", second.stdout)
+        self.assertEqual(len(list((self.root / "var/backups").iterdir())), count)
+
+    def test_candidate_failure_rolls_back_before_apply(self):
+        self.init_net()
+        failed = self.run_tool(INET_TOOL, *self.STATIC, "--yes", SSH_CONNECTION="client", MOCK_NETPLAN_GENERATE_FAIL="1")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertFalse((self.root / "etc/netplan/99-essential-inet.yaml").exists())
+        self.assertIn("candidate validation failed", failed.stderr)
+
+    def test_apply_and_verification_failures_roll_back(self):
+        for env in ({"MOCK_NETPLAN_APPLY_FAIL": "1"}, {"MOCK_NETPLAN_SKIP_RUNTIME": "1"}):
+            with self.subTest(env=env):
+                self.tearDown()
+                self.setUp()
+                self.init_net()
+                failed = self.run_tool(INET_TOOL, *self.STATIC, "--yes", SSH_CONNECTION="client", **env)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertFalse((self.root / "etc/netplan/99-essential-inet.yaml").exists())
+                self.assertIn("roll", failed.stderr.lower())
+
+    def test_confirmation_token_and_invalid_token(self):
+        self.init_net()
+        result = self.run_tool(INET_TOOL, *self.STATIC, "--yes", SSH_CONNECTION="client")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        token = (self.root / "run/essential-inet/lock/token").read_text().strip()
+        invalid = self.run_tool(INET_TOOL, "--confirm", "../bad")
+        self.assertNotEqual(invalid.returncode, 0)
+        confirmed = self.run_tool(INET_TOOL, "--confirm", token)
+        self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
+        self.assertFalse((self.root / "run/essential-inet/lock").exists())
+
+    def test_watchdog_timeout_rolls_back_and_transaction_lock_refuses_second_change(self):
+        self.init_net()
+        first = self.run_tool(INET_TOOL, *self.STATIC, "--yes", SSH_CONNECTION="client", ESSENTIAL_INET_TIMEOUT="30")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        locked = self.run_tool(INET_TOOL, "--interface", "ens18", "--mode", "dhcp", "--yes", SSH_CONNECTION="client")
+        self.assertNotEqual(locked.returncode, 0)
+        self.assertIn("transaction", locked.stderr)
+        token = (self.root / "run/essential-inet/lock/token").read_text().strip()
+        watchdog = self.run_tool(INET_TOOL, "--watchdog", token, ESSENTIAL_INET_WATCHDOG_TIMEOUT="0")
+        self.assertEqual(watchdog.returncode, 0, watchdog.stderr)
+        self.assertFalse((self.root / "etc/netplan/99-essential-inet.yaml").exists())
+
+    def test_ifupdown_replaces_only_one_ipv4_stanza(self):
+        self.init_net(distro="debian", backend="ifupdown")
+        interfaces = self.root / "etc/network/interfaces"
+        interfaces.write_text(
+            "auto ens18\niface ens18 inet dhcp\n\n"
+            "iface ens18 inet6 static\n    address 2001:db8::2/64\n\n"
+            "auto ens19\niface ens19 inet dhcp\n"
+        )
+        result = self.run_tool(INET_TOOL, *self.STATIC, "--yes", SSH_CONNECTION="client")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = interfaces.read_text()
+        self.assertEqual(text.count("iface ens18 inet static"), 1)
+        self.assertNotIn("iface ens18 inet dhcp", text)
+        self.assertIn("iface ens18 inet6 static", text)
+        self.assertIn("iface ens19 inet dhcp", text)
+
+    def test_ifupdown_duplicate_stanza_is_rejected_and_top_level_comment_is_preserved(self):
+        self.init_net(distro="debian", backend="ifupdown")
+        interfaces = self.root / "etc/network/interfaces"
+        interfaces.write_text("auto ens18\niface ens18 inet dhcp\n# ens19 follows\nauto ens19\niface ens19 inet dhcp\n")
+        changed = self.run_tool(INET_TOOL, "--dry-run", *self.STATIC)
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        self.assertIn("# ens19 follows", changed.stdout)
+        interfaces.write_text("auto ens18\niface ens18 inet dhcp\nhostname stale\nup /usr/local/bin/stale\nallow-foo ens19\niface ens19 inet dhcp\n")
+        unindented = self.run_tool(INET_TOOL, "--dry-run", *self.STATIC)
+        self.assertEqual(unindented.returncode, 0, unindented.stderr)
+        self.assertNotIn("hostname stale", unindented.stdout)
+        self.assertNotIn("/usr/local/bin/stale", unindented.stdout)
+        self.assertIn("allow-foo ens19", unindented.stdout)
+        interfaces.write_text("auto ens18\niface ens18 inet dhcp\niface ens18 inet static\n    address 192.0.2.9/24\n")
+        duplicate = self.run_tool(INET_TOOL, "--dry-run", *self.STATIC)
+        self.assertNotEqual(duplicate.returncode, 0)
+        self.assertIn("duplicate IPv4 stanzas", duplicate.stderr)
+
+        nested = self.root / "etc/network/interfaces.d/base"
+        nested.parent.mkdir(exist_ok=True)
+        interfaces.write_text("source-directory /etc/network/interfaces.d\n")
+        nested.write_text("source /etc/network/more/*\n")
+        nested_result = self.run_tool(INET_TOOL, "--dry-run", *self.STATIC)
+        self.assertNotEqual(nested_result.returncode, 0)
+        self.assertIn("nested interfaces includes", nested_result.stderr)
+
+    def test_invalid_watchdog_timeout_does_not_mutate(self):
+        self.init_net()
+        failed = self.run_tool(INET_TOOL, *self.STATIC, "--yes", SSH_CONNECTION="client", ESSENTIAL_INET_TIMEOUT="0")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("invalid rollback timeout", failed.stderr)
+        self.assertFalse((self.root / "etc/netplan/99-essential-inet.yaml").exists())
+        self.assertFalse((self.root / "var/backups").exists())
+
+    def test_safe_elevation_and_signal_temp_cleanup(self):
+        self.init_net()
+        self.mock("sudo")
+        self.mock("su")
+        result = self.run_tool(INET_TOOL, "--dry-run", *self.STATIC, MOCK_EUID="1000")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("sudo <-v>", self.log.read_text())
+        applied = self.run_tool(INET_TOOL, *self.STATIC, "--yes", SSH_CONNECTION="client", MOCK_EUID="1000", MOCK_SUDO_FAIL="1")
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        calls = self.log.read_text()
+        self.assertIn("sudo <-v>", calls)
+        self.assertIn(f"su <-s> </bin/sh> <root> <--> <{INET_TOOL}>", calls)
+        self.assertNotIn("<-c>", calls)
+
+    def test_signal_cleans_candidate_and_rolls_back(self):
+        self.init_net()
+        merged = self.env | {
+            "SSH_CONNECTION": "client",
+            "MOCK_NETPLAN_GENERATE_DELAY": "1",
+        }
+        process = subprocess.Popen(
+            ["/bin/dash", str(INET_TOOL), *self.STATIC, "--yes"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=merged,
+            start_new_session=True,
+        )
+        managed = self.root / "etc/netplan/99-essential-inet.yaml"
+        for _ in range(100):
+            if managed.exists():
+                break
+            import time
+            time.sleep(0.02)
+        self.assertTrue(managed.exists())
+        os.killpg(process.pid, 15)
+        stdout, stderr = process.communicate(timeout=10)
+        self.assertNotEqual(process.returncode, 0, stdout + stderr)
+        self.assertFalse(managed.exists())
+        self.assertFalse(list((self.root / "etc/netplan").glob(".essential-inet.*")))
+
+
 class StaticSafetyTests(unittest.TestCase):
     def test_scripts_are_executable_posix_and_have_no_payload_or_sh_c(self):
-        for tool in (SUDO_TOOL, CINIT_TOOL):
+        for tool in (SUDO_TOOL, CINIT_TOOL, INET_TOOL):
             text = tool.read_text()
             self.assertTrue(text.startswith("#!/usr/bin/env sh\n# essential tool:"))
             self.assertIn("\n# source: https://github.com/x-inu/essential/tree/main/tools\n", text)

@@ -1,0 +1,1260 @@
+#!/usr/bin/env sh
+# essential tool: inet
+# source: https://github.com/x-inu/essential/tree/main/tools
+set -eu
+
+log() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() {
+	printf 'error: %s\n' "$*" >&2
+	exit 1
+}
+usage() {
+	cat <<'EOF'
+Usage:
+  inet
+  inet --show [--interface IFACE]
+  inet --dry-run [configuration options]
+  inet --interface IFACE --mode static --address IPV4/CIDR \
+       --gateway IPV4 --dns IPV4[,IPV4] [--search DOMAIN] \
+       [--metric NUMBER] [--mtu NUMBER] [--yes]
+  inet --interface IFACE --mode dhcp [--metric NUMBER] [--mtu NUMBER] [--yes]
+  inet --confirm TOKEN
+  inet --rollback BACKUP_DIRECTORY
+
+Options:
+  --show             show detected interfaces and current network state
+  --dry-run          review without writing, backing up, or applying changes
+  --interface NAME   select an existing non-loopback Ethernet interface
+  --mode MODE        static or dhcp
+  --address CIDR     primary static IPv4 address and prefix
+  --gateway IPV4     static default gateway
+  --dns LIST         primary and optional secondary IPv4 DNS, comma-separated
+  --search DOMAIN    optional DNS search domain
+  --metric NUMBER    optional non-negative default-route metric
+  --mtu NUMBER       optional MTU from 576 through 9000
+  --yes              skip only the final pre-apply confirmation
+  --confirm TOKEN    accept a pending transaction and stop its watchdog
+  --rollback DIR     restore a backup created by essential-inet
+  --help             show this help
+
+Interactive use over SSH:
+  curl -fsSL https://raw.xinu.my.id/inet -o /tmp/inet
+  sudo sh /tmp/inet
+EOF
+}
+
+ROOT=${ESSENTIAL_TEST_ROOT:-}
+case "$ROOT" in
+"") ;;
+/tmp/*)
+	case "$ROOT/" in *'/../'* | *'/./'* | *'//'*) die "invalid test root" ;; esac
+	[ -d "$ROOT" ] || die "invalid test root"
+	[ ! -L "$ROOT" ] || die "invalid test root"
+	;;
+*) die "invalid test root" ;;
+esac
+
+ETC=${ROOT}/etc
+RUN=${ROOT}/run/essential-inet
+BACKUP_PARENT=${ROOT}/var/backups
+NETPLAN_DIR=$ETC/netplan
+INTERFACES=$ETC/network/interfaces
+SYS_CLASS_NET=${ROOT}/sys/class/net
+SELF=$0
+YES=0
+DRY_RUN=0
+SHOW=0
+IFACE=
+MODE=
+ADDRESS=
+GATEWAY=
+DNS=
+SEARCH=
+METRIC=
+MTU=
+ACTION=config
+ACTION_VALUE=
+ACTION_SET=0
+BACKEND=
+CONFIG_FILE=
+IF_FILES=
+NETPLAN_SOURCE=
+NETPLAN_RENDERER=
+SECONDARY=
+CURRENT_PRIMARY=
+CURRENT_GATEWAY=
+CURRENT_METRIC=
+CURRENT_MTU=
+CURRENT_DNS=
+CURRENT_SEARCH=
+CANDIDATE_CONTENT=
+TEMP_CONFIG=
+LOCK_HELD=0
+TRANSACTION_TOKEN=
+TRANSACTION_DIR=
+BACKUP=
+MUTATED=0
+PENDING=0
+
+cleanup() {
+	[ -z "$TEMP_CONFIG" ] || rm -f "$TEMP_CONFIG"
+	if [ "$LOCK_HELD" -eq 1 ] && [ "$PENDING" -eq 0 ]; then
+		rm -rf "$RUN/lock"
+		LOCK_HELD=0
+	fi
+}
+interrupted() {
+	warn "interrupted"
+	ROLLBACK_ACTIVE=0
+	if [ -n "$TRANSACTION_DIR" ] && [ -f "$TRANSACTION_DIR/rolling-back" ]; then ROLLBACK_ACTIVE=1; fi
+	if [ "$MUTATED" -eq 1 ] && [ -n "$BACKUP" ] && [ "$ROLLBACK_ACTIVE" -eq 0 ]; then
+		warn "restoring the previous configuration"
+		if rollback_backup "$BACKUP" automatic; then
+			MUTATED=0
+			[ "$PENDING" -eq 0 ] || stop_watchdog "$TRANSACTION_TOKEN"
+		else
+			warn "automatic rollback failed; use: inet --rollback $BACKUP"
+		fi
+	fi
+	if [ "$MUTATED" -eq 0 ] && [ "$PENDING" -eq 1 ]; then stop_watchdog "$TRANSACTION_TOKEN"; fi
+	cleanup
+	exit 1
+}
+trap cleanup EXIT
+trap interrupted HUP INT TERM
+
+need_value() {
+	[ "$#" -ge 2 ] || die "$1 requires a value"
+}
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	--help)
+		usage
+		exit 0
+		;;
+	--show) SHOW=1 ;;
+	--dry-run) DRY_RUN=1 ;;
+	--yes) YES=1 ;;
+	--interface)
+		need_value "$@"
+		IFACE=$2
+		shift
+		;;
+	--mode)
+		need_value "$@"
+		MODE=$2
+		shift
+		;;
+	--address)
+		need_value "$@"
+		ADDRESS=$2
+		shift
+		;;
+	--gateway)
+		need_value "$@"
+		GATEWAY=$2
+		shift
+		;;
+	--dns)
+		need_value "$@"
+		DNS=$2
+		shift
+		;;
+	--search)
+		need_value "$@"
+		SEARCH=$2
+		shift
+		;;
+	--metric)
+		need_value "$@"
+		METRIC=$2
+		shift
+		;;
+	--mtu)
+		need_value "$@"
+		MTU=$2
+		shift
+		;;
+	--confirm)
+		need_value "$@"
+		[ "$ACTION_SET" -eq 0 ] || die "only one of --confirm, --rollback, or --watchdog may be used"
+		ACTION=confirm
+		ACTION_SET=1
+		ACTION_VALUE=$2
+		shift
+		;;
+	--rollback)
+		need_value "$@"
+		[ "$ACTION_SET" -eq 0 ] || die "only one of --confirm, --rollback, or --watchdog may be used"
+		ACTION=rollback
+		ACTION_SET=1
+		ACTION_VALUE=$2
+		shift
+		;;
+	--watchdog)
+		need_value "$@"
+		[ "$ACTION_SET" -eq 0 ] || die "only one of --confirm, --rollback, or --watchdog may be used"
+		ACTION=watchdog
+		ACTION_SET=1
+		ACTION_VALUE=$2
+		shift
+		;;
+	--*)
+		usage >&2
+		die "unknown option: $1"
+		;;
+	*) die "unexpected argument: $1" ;;
+	esac
+	shift
+done
+
+validate_token() {
+	[ "${#1}" -eq 48 ] || return 1
+	case "$1" in *[!0123456789abcdef]*) return 1 ;; esac
+}
+require_root() {
+	[ "$(id -u)" -ne 0 ] || return 0
+	if [ ! -f "$SELF" ] || [ ! -r "$SELF" ] ||
+		! awk 'NR == 2 { ok = ($0 == "# essential tool: inet") } END { exit !ok }' "$SELF"; then
+		die "cannot elevate piped input; download this script, then run: sudo sh /tmp/inet"
+	fi
+	if command -v sudo >/dev/null 2>&1; then
+		log "Requesting root with sudo..."
+		if sudo -v; then exec sudo /bin/sh "$SELF" "$@"; fi
+		warn "sudo elevation failed; trying su"
+	fi
+	command -v su >/dev/null 2>&1 || die "root is required and su is unavailable"
+	log "Enter the root password for su."
+	exec su -s /bin/sh root -- "$SELF" "$@"
+}
+
+read_os_release() {
+	OS_ID=unknown
+	OS_VERSION=unknown
+	if [ -r "$ETC/os-release" ]; then
+		VALUE=$(awk -F= '$1 == "ID" { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' "$ETC/os-release")
+		[ -z "$VALUE" ] || OS_ID=$VALUE
+		VALUE=$(awk -F= '$1 == "VERSION_ID" { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' "$ETC/os-release")
+		[ -z "$VALUE" ] || OS_VERSION=$VALUE
+	fi
+}
+validate_iface_name() {
+	case "$1" in
+	"" | lo | -* | *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-]*) return 1 ;;
+	esac
+	[ "${#1}" -le 15 ]
+}
+iface_exists() {
+	validate_iface_name "$1" || return 1
+	ip -o link show dev "$1" >/dev/null 2>&1
+}
+is_plain_ethernet() {
+	DETAIL=$(ip -d -o link show dev "$IFACE" 2>/dev/null) || return 1
+	case "$DETAIL" in
+	*" master "* | *" bridge "* | *" bond "* | *" vlan "* | *" vxlan "* | *" wireguard "*) return 1 ;;
+	esac
+	case "$DETAIL" in *"link/ether"*) ;; *) return 1 ;; esac
+	[ ! -d "$SYS_CLASS_NET/$IFACE/wireless" ]
+}
+ipv4_valid() {
+	printf '%s\n' "$1" | awk -F. '
+		NF != 4 { exit 1 }
+		{ for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]+$/ || $i + 0 > 255 || ($i ~ /^0[0-9]/)) exit 1 }
+	'
+}
+cidr_valid() {
+	case "$1" in */*) ;; *) return 1 ;; esac
+	IP_PART=${1%/*}
+	PREFIX_PART=${1##*/}
+	ipv4_valid "$IP_PART" || return 1
+	case "$PREFIX_PART" in "" | *[!0123456789]*) return 1 ;; esac
+	[ "$PREFIX_PART" -le 32 ]
+}
+ip_number() {
+	printf '%s\n' "$1" | awk -F. '{ printf "%.0f\n", (($1 * 256 + $2) * 256 + $3) * 256 + $4 }'
+}
+subnet_number() {
+	IP_VALUE=$(ip_number "$1")
+	awk -v value="$IP_VALUE" -v prefix="$2" 'BEGIN { block = 2 ^ (32 - prefix); printf "%.0f\n", int(value / block) * block }'
+}
+validate_address_semantics() {
+	IP_PART=${ADDRESS%/*}
+	PREFIX_PART=${ADDRESS##*/}
+	[ "$PREFIX_PART" -ge 31 ] && warn "prefix /$PREFIX_PART is point-to-point or host-only and needs special routing"
+	if [ "$PREFIX_PART" -le 30 ]; then
+		NUMBER=$(ip_number "$IP_PART")
+		NETWORK=$(subnet_number "$IP_PART" "$PREFIX_PART")
+		BROADCAST=$(awk -v network="$NETWORK" -v prefix="$PREFIX_PART" 'BEGIN { printf "%.0f\n", network + (2 ^ (32 - prefix)) - 1 }')
+		[ "$NUMBER" != "$NETWORK" ] || die "$IP_PART is the subnet network address"
+		[ "$NUMBER" != "$BROADCAST" ] || die "$IP_PART is the subnet broadcast address"
+	fi
+	if [ -n "$GATEWAY" ]; then
+		GW_NETWORK=$(subnet_number "$GATEWAY" "$PREFIX_PART")
+		IP_NETWORK=$(subnet_number "$IP_PART" "$PREFIX_PART")
+		[ "$GW_NETWORK" = "$IP_NETWORK" ] || die "gateway $GATEWAY is outside the $ADDRESS subnet"
+		[ "$GATEWAY" != "$IP_PART" ] || die "gateway must not equal the interface address"
+	fi
+}
+validate_dns() {
+	[ -n "$DNS" ] || return 0
+	case "$DNS" in *,*,*) die "at most two DNS servers are supported" ;; esac
+	OLD_IFS=$IFS
+	IFS=,
+	# Intentional splitting uses only the comma separator set above.
+	# shellcheck disable=SC2086
+	set -- $DNS
+	IFS=$OLD_IFS
+	if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then die "invalid DNS list"; fi
+	for SERVER in "$@"; do ipv4_valid "$SERVER" || die "invalid DNS IPv4 address: $SERVER"; done
+}
+validate_search() {
+	[ -z "$SEARCH" ] && return 0
+	[ "${#SEARCH}" -le 253 ] || return 1
+	case "$SEARCH" in -* | *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-]* | *..* | *.) return 1 ;; esac
+	printf '%s\n' "$SEARCH" | awk -F. 'NF < 1 { exit 1 } { for (i=1;i<=NF;i++) if ($i == "" || length($i)>63 || $i ~ /^-/ || $i ~ /-$/) exit 1 }'
+}
+decimal_le() {
+	awk -v value="$1" -v limit="$2" 'BEGIN {
+		sub(/^0+/, "", value); if (value == "") value="0"
+		if (length(value) < length(limit)) exit 0
+		if (length(value) > length(limit)) exit 1
+		exit !("x" value <= "x" limit)
+	}'
+}
+validate_options() {
+	case "$MODE" in static | dhcp) ;; *) die "mode must be static or dhcp" ;; esac
+	validate_iface_name "$IFACE" || die "invalid interface name: $IFACE"
+	iface_exists "$IFACE" || die "interface does not exist: $IFACE"
+	if [ "$MODE" = static ]; then
+		[ -n "$ADDRESS" ] || die "--address is required for static mode"
+		[ -n "$GATEWAY" ] || die "--gateway is required for static mode"
+		[ -n "$DNS" ] || die "--dns is required for static mode"
+		cidr_valid "$ADDRESS" || die "invalid IPv4/CIDR: $ADDRESS"
+		ipv4_valid "$GATEWAY" || die "invalid gateway IPv4: $GATEWAY"
+		validate_dns
+		validate_search || die "invalid DNS search domain: $SEARCH"
+		validate_address_semantics
+	else
+		[ -z "$ADDRESS$GATEWAY$DNS$SEARCH" ] || die "address, gateway, DNS, and search are valid only in static mode"
+	fi
+	if [ -n "$METRIC" ]; then
+		case "$METRIC" in *[!0123456789]* | "") die "metric must be a non-negative integer" ;; esac
+		decimal_le "$METRIC" 4294967295 || die "metric is too large"
+	fi
+	if [ -n "$MTU" ]; then
+		case "$MTU" in *[!0123456789]* | "") die "MTU must be an integer from 576 through 9000" ;; esac
+		decimal_le "$MTU" 9000 || die "MTU must be from 576 through 9000"
+		[ "$MTU" -ge 576 ] || die "MTU must be from 576 through 9000"
+	fi
+}
+
+netplan_file_defines() {
+	awk -v target="$IFACE" '
+		/\t/ { next }
+		/^  [a-zA-Z0-9_-]+:[[:space:]]*$/ { section=$0; sub(/^  /, "", section); sub(/:.*/, "", section); next }
+		section == "ethernets" && /^    [a-zA-Z0-9_.:-]+:[[:space:]]*$/ { name=$0; sub(/^    /, "", name); sub(/:.*/, "", name); if (name == target) found=1 }
+		END { exit !found }
+	' "$1"
+}
+netplan_file_unsupported_topology() {
+	awk -v target="$IFACE" '
+		/^  (bridges|bonds|vlans|wifis):[[:space:]]*$/ { section=$0; sub(/^  /, "", section); sub(/:.*/, "", section); next }
+		/^  [a-zA-Z0-9_-]+:[[:space:]]*$/ { section=""; next }
+		section != "" && $0 ~ "^[[:space:]]+" target ":[[:space:]]*$" { found=1 }
+		section != "" && $0 ~ /^[[:space:]]+(interfaces|link):/ && $0 ~ target { found=1 }
+		section != "" && $0 ~ "^[[:space:]]*-[[:space:]]*" target "([[:space:]#]|$)" { found=1 }
+		END { exit !found }
+	' "$1"
+}
+netplan_managed_has_ipv6() {
+	awk -v target="$IFACE" '
+		/^    [a-zA-Z0-9_.:-]+:[[:space:]]*$/ { in_target=($0 == "    " target ":"); next }
+		in_target && /^      (dhcp6|accept-ra|link-local):/ { found=1 }
+		in_target && /^[[:space:]]+- [0-9a-fA-F]*:/ { found=1 }
+		END { exit !found }
+	' "$1"
+}
+netplan_managed_has_other_interface() {
+	awk -v target="$IFACE" '
+		/^  ethernets:[[:space:]]*$/ { in_eth=1; next }
+		/^  [a-zA-Z0-9_-]+:[[:space:]]*$/ { in_eth=0; next }
+		in_eth && /^    [a-zA-Z0-9_.:-]+:[[:space:]]*$/ { name=$0; sub(/^    /, "", name); sub(/:.*/, "", name); if (name != target) found=1 }
+		END { exit !found }
+	' "$1"
+}
+netplan_external_conflict() {
+	awk -v target="$IFACE" '
+		/^    [a-zA-Z0-9_.:-]+:[[:space:]]*$/ { in_target=($0 == "    " target ":"); next }
+		in_target && /^      (addresses|gateway4|routes|nameservers):/ { found=1 }
+		END { exit !found }
+	' "$1"
+}
+detect_netplan() {
+	NETPLAN_COUNT=0
+	NETPLAN_SOURCE=
+	NETPLAN_RENDERER=
+	command -v netplan >/dev/null 2>&1 || return 1
+	for FILE in "$NETPLAN_DIR"/*.yaml "$NETPLAN_DIR"/*.yml; do
+		[ -f "$FILE" ] || continue
+		netplan_file_unsupported_topology "$FILE" && die "$IFACE is part of an unsupported Netplan bridge, bond, VLAN, or Wi-Fi topology"
+		if netplan_file_defines "$FILE"; then
+			if [ "$FILE" = "$NETPLAN_DIR/99-essential-inet.yaml" ]; then
+				CONFIG_FILE=$FILE
+			else
+				NETPLAN_COUNT=$((NETPLAN_COUNT + 1))
+				NETPLAN_SOURCE=$FILE
+			fi
+		fi
+		VALUE=$(awk '/^[[:space:]]*renderer:[[:space:]]*/ { print $2; exit }' "$FILE")
+		if [ -n "$VALUE" ]; then
+			if [ -n "$NETPLAN_RENDERER" ] && [ "$NETPLAN_RENDERER" != "$VALUE" ]; then die "Netplan renderer is ambiguous"; fi
+			NETPLAN_RENDERER=$VALUE
+		fi
+	done
+	if [ "$NETPLAN_COUNT" -eq 0 ] && [ -z "$CONFIG_FILE" ]; then return 1; fi
+	[ "$NETPLAN_COUNT" -le 1 ] || die "more than one Netplan file defines $IFACE"
+	case "$NETPLAN_RENDERER" in NetworkManager | networkmanager) die "NetworkManager-rendered Netplan is not supported" ;; esac
+	MANAGED=$NETPLAN_DIR/99-essential-inet.yaml
+	if [ -f "$MANAGED" ] && netplan_managed_has_other_interface "$MANAGED"; then
+		die "$MANAGED manages another interface; use its backup/rollback before selecting $IFACE"
+	fi
+	if [ -n "$CONFIG_FILE" ] && netplan_managed_has_ipv6 "$CONFIG_FILE"; then
+		die "$CONFIG_FILE contains IPv6 settings; move them to the owning Netplan file before using inet"
+	fi
+	if [ -n "$NETPLAN_SOURCE" ] && [ "$NETPLAN_SOURCE" != "$MANAGED" ] && netplan_external_conflict "$NETPLAN_SOURCE"; then
+		die "$NETPLAN_SOURCE contains addresses, routes, gateway4, or nameservers for $IFACE; refusing an unsafe Netplan sequence merge"
+	fi
+	CONFIG_FILE=$MANAGED
+	return 0
+}
+
+add_if_file() {
+	case " $IF_FILES " in *" $1 "*) ;; *) IF_FILES="$IF_FILES $1" ;; esac
+}
+load_interfaces_files() {
+	IF_FILES=
+	[ -f "$INTERFACES" ] || return 0
+	add_if_file "$INTERFACES"
+	SOURCES=$(awk '
+		$1 == "source" && NF == 2 { print "file:" $2 }
+		$1 == "source-directory" && NF == 2 { print "dir:" $2 }
+	' "$INTERFACES")
+	for ITEM in $SOURCES; do
+		KIND=${ITEM%%:*}
+		PATH_VALUE=${ITEM#*:}
+		case "$PATH_VALUE" in /etc/*) ;; *) die "unsupported relative or non-/etc interfaces include: $PATH_VALUE" ;; esac
+		case "/$PATH_VALUE/" in *'/../'* | *'/./'*) die "unsafe interfaces include: $PATH_VALUE" ;; esac
+		if [ "$KIND" = dir ]; then
+			for FILE in "${ROOT}${PATH_VALUE}"/*; do
+				[ -f "$FILE" ] || continue
+				case "${FILE##*/}" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) continue ;; esac
+				add_if_file "$FILE"
+			done
+		else
+			for FILE in ${ROOT}${PATH_VALUE}; do
+				[ -f "$FILE" ] || continue
+				add_if_file "$FILE"
+			done
+		fi
+	done
+	for FILE in $IF_FILES; do
+		[ "$FILE" = "$INTERFACES" ] && continue
+		awk '$1 == "source" || $1 == "source-directory" { found=1 } END { exit !found }' "$FILE" && die "nested interfaces includes are not supported: $FILE"
+	done
+}
+if_file_defines() {
+	awk -v target="$IFACE" '$1 == "iface" && $2 == target && $3 == "inet" { found=1 } END { exit !found }' "$1"
+}
+if_file_stanza_count() {
+	awk -v target="$IFACE" '$1 == "iface" && $2 == target && $3 == "inet" { count++ } END { print count + 0 }' "$1"
+}
+interfaces_dir_loaded() {
+	awk '
+		$1 == "source-directory" && $2 == "/etc/network/interfaces.d" { found=1 }
+		$1 == "source" && $2 == "/etc/network/interfaces.d/*" { found=1 }
+		END { exit !found }
+	' "$INTERFACES"
+}
+detect_ifupdown() {
+	load_interfaces_files
+	FOUND=0
+	FOUND_FILE=
+	for FILE in $IF_FILES; do
+		if if_file_defines "$FILE"; then
+			STANZA_COUNT=$(if_file_stanza_count "$FILE")
+			[ "$STANZA_COUNT" -eq 1 ] || die "$FILE contains duplicate IPv4 stanzas for $IFACE"
+			FOUND=$((FOUND + STANZA_COUNT))
+			FOUND_FILE=$FILE
+		fi
+	done
+	[ "$FOUND" -le 1 ] || die "more than one ifupdown IPv4 stanza defines $IFACE"
+	if [ "$FOUND" -eq 1 ]; then
+		CONFIG_FILE=$FOUND_FILE
+		return 0
+	fi
+	[ -f "$INTERFACES" ] || return 1
+	interfaces_dir_loaded || return 1
+	ACTIVATED=0
+	for FILE in $IF_FILES; do
+		awk -v target="$IFACE" '($1 == "auto" || $1 ~ /^allow-/) { for (i=2;i<=NF;i++) if ($i == target) found=1 } END { exit !found }' "$FILE" && ACTIVATED=1
+	done
+	[ "$ACTIVATED" -eq 1 ] || return 1
+	CONFIG_FILE=$ETC/network/interfaces.d/99-essential-inet
+	return 0
+}
+networkmanager_owns() {
+	command -v nmcli >/dev/null 2>&1 || return 1
+	NM_STATE=$(nmcli -t -f GENERAL.STATE,GENERAL.CONNECTION device show "$IFACE" 2>/dev/null || :)
+	case "$NM_STATE" in *connected* | *connecting* | *CONNECTED* | *CONNECTING*) return 0 ;; esac
+	return 1
+}
+native_networkd_owns() {
+	command -v networkctl >/dev/null 2>&1 || return 1
+	NETWORKD_STATE=$(networkctl status --no-pager -- "$IFACE" 2>/dev/null || :)
+	case "$NETWORKD_STATE" in *"Network File:"*)
+		case "$NETWORKD_STATE" in *"Network File: n/a"*) return 1 ;; *) return 0 ;; esac
+		;;
+	esac
+	return 1
+}
+detect_backend() {
+	NETPLAN_FOUND=0
+	IFUP_FOUND=0
+	detect_netplan && NETPLAN_FOUND=1
+	detect_ifupdown && IFUP_FOUND=1
+	if networkmanager_owns; then
+		die "NetworkManager manages $IFACE; this backend is not supported"
+	fi
+	[ "$NETPLAN_FOUND" -eq 0 ] || [ "$IFUP_FOUND" -eq 0 ] || die "backend is ambiguous: Netplan and ifupdown both define $IFACE"
+	if [ "$NETPLAN_FOUND" -eq 1 ]; then
+		BACKEND=netplan
+		return
+	fi
+	if [ "$IFUP_FOUND" -eq 1 ]; then
+		BACKEND=ifupdown
+		return
+	fi
+	if native_networkd_owns; then die "native systemd-networkd manages $IFACE without Netplan; this backend is not supported"; fi
+	die "no supported backend definitively manages $IFACE"
+}
+backend_label() {
+	SAVED_IFACE=$IFACE
+	IFACE=$1
+	LABEL=unknown
+	if networkmanager_owns; then
+		LABEL=NetworkManager
+	else
+		NP=0
+		command -v netplan >/dev/null 2>&1 && for FILE in "$NETPLAN_DIR"/*.yaml "$NETPLAN_DIR"/*.yml; do
+			[ -f "$FILE" ] && netplan_file_defines "$FILE" && NP=1
+		done
+		load_interfaces_files
+		IU=0
+		for FILE in $IF_FILES; do [ -f "$FILE" ] && if_file_defines "$FILE" && IU=1; done
+		if [ "$NP" -eq 1 ] && [ "$IU" -eq 1 ]; then
+			LABEL=ambiguous
+		elif [ "$NP" -eq 1 ]; then
+			LABEL=netplan
+		elif [ "$IU" -eq 1 ]; then
+			LABEL=ifupdown
+		elif native_networkd_owns; then
+			LABEL=systemd-networkd
+		fi
+	fi
+	IFACE=$SAVED_IFACE
+	printf '%s' "$LABEL"
+}
+
+default_iface() {
+	ip -4 route show default 2>/dev/null | awk '$1 == "default" { for (i=1;i<=NF;i++) if ($i == "dev") { print $(i+1); exit } }'
+}
+current_addresses() {
+	ip -o -4 addr show dev "$IFACE" scope global 2>/dev/null | awk '{ for (i=1;i<=NF;i++) if ($i == "inet") print $(i+1) }'
+}
+current_gateway() {
+	ip -4 route show default dev "$IFACE" 2>/dev/null | awk '$1 == "default" { for (i=1;i<=NF;i++) if ($i == "via") { print $(i+1); exit } }'
+}
+current_metric() {
+	ip -4 route show default dev "$IFACE" 2>/dev/null | awk '$1 == "default" { for (i=1;i<=NF;i++) if ($i == "metric") { print $(i+1); exit } }'
+}
+current_mtu() {
+	ip -o link show dev "$IFACE" | awk '{ for (i=1;i<=NF;i++) if ($i == "mtu") { print $(i+1); exit } }'
+}
+current_mac() {
+	ip -o link show dev "$1" | awk '{ for (i=1;i<=NF;i++) if ($i == "link/ether") { print $(i+1); exit } }'
+}
+current_state() {
+	ip -o link show dev "$1" | awk '{ for (i=1;i<=NF;i++) if ($i == "state") { print $(i+1); exit } }'
+}
+read_current() {
+	ADDRESSES=$(current_addresses)
+	CURRENT_PRIMARY=$(printf '%s\n' "$ADDRESSES" | awk 'NF { print; exit }')
+	SECONDARY=$(printf '%s\n' "$ADDRESSES" | awk 'NF { if (seen++) print }')
+	CURRENT_GATEWAY=$(current_gateway)
+	CURRENT_METRIC=$(current_metric)
+	CURRENT_MTU=$(current_mtu)
+	CURRENT_DNS=
+	CURRENT_SEARCH=
+	if command -v resolvectl >/dev/null 2>&1; then
+		CURRENT_DNS=$(resolvectl dns "$IFACE" 2>/dev/null | awk -F: 'NF > 1 { sub(/^[[:space:]]*/, "", $2); print $2; exit }')
+		CURRENT_SEARCH=$(resolvectl domain "$IFACE" 2>/dev/null | awk -F: 'NF > 1 { sub(/^[[:space:]]*/, "", $2); print $2; exit }')
+	elif [ -r "$ETC/resolv.conf" ]; then
+		CURRENT_DNS=$(awk '$1 == "nameserver" { if (out != "") out=out ","; out=out $2 } END { print out }' "$ETC/resolv.conf")
+		CURRENT_SEARCH=$(awk '$1 == "search" { print $2; exit }' "$ETC/resolv.conf")
+	fi
+}
+
+show_interfaces() {
+	read_os_release
+	log "System: $OS_ID $OS_VERSION"
+	log "Interface       State  MAC                IPv4                 MTU   Gateway         Default Backend"
+	ip -o link show | awk -F': ' '$2 !~ /^lo(@|$)/ { sub(/@.*/, "", $2); print $2 }' | while IFS= read -r ITEM; do
+		validate_iface_name "$ITEM" || continue
+		STATE=$(current_state "$ITEM")
+		MAC=$(current_mac "$ITEM")
+		ADDR=$(ip -o -4 addr show dev "$ITEM" scope global 2>/dev/null | awk '{ for (i=1;i<=NF;i++) if ($i == "inet") { print $(i+1); exit } }')
+		GW=$(ip -4 route show default dev "$ITEM" 2>/dev/null | awk '{ for (i=1;i<=NF;i++) if ($i == "via") { print $(i+1); exit } }')
+		ITEM_MTU=$(ip -o link show dev "$ITEM" | awk '{ for (i=1;i<=NF;i++) if ($i == "mtu") { print $(i+1); exit } }')
+		MARK=
+		[ "$(default_iface)" = "$ITEM" ] && MARK=yes
+		LABEL=$(backend_label "$ITEM")
+		printf '%-15s %-6s %-18s %-20s %-5s %-15s %-7s %s\n' "$ITEM" "${STATE:--}" "${MAC:--}" "${ADDR:--}" "${ITEM_MTU:--}" "${GW:--}" "${MARK:--}" "$LABEL"
+	done
+}
+
+tty_available() { [ -r /dev/tty ] && [ -w /dev/tty ]; }
+interactive_tty() { tty_available && (: </dev/tty) 2>/dev/null; }
+tui_message() {
+	TITLE=$1
+	TEXT=$2
+	if command -v whiptail >/dev/null 2>&1; then
+		whiptail --title "$TITLE" --msgbox "$TEXT" 22 78 </dev/tty >/dev/tty
+	elif command -v dialog >/dev/null 2>&1; then
+		dialog --title "$TITLE" --msgbox "$TEXT" 22 78 </dev/tty >/dev/tty
+	else
+		printf '\n%s\n%s\n\n' "$TITLE" "$TEXT" >/dev/tty
+	fi
+}
+tui_input() {
+	TITLE=$1
+	PROMPT=$2
+	DEFAULT_VALUE=$3
+	if command -v whiptail >/dev/null 2>&1; then
+		whiptail --title "$TITLE" --inputbox "$PROMPT" 12 78 "$DEFAULT_VALUE" 3>&1 1>/dev/tty 2>&3 </dev/tty
+	elif command -v dialog >/dev/null 2>&1; then
+		dialog --stdout --title "$TITLE" --inputbox "$PROMPT" 12 78 "$DEFAULT_VALUE" </dev/tty >/dev/tty
+	else
+		printf '%s [%s]: ' "$PROMPT" "$DEFAULT_VALUE" >/dev/tty
+		IFS= read -r VALUE </dev/tty || die "input could not be read"
+		[ -n "$VALUE" ] && printf '%s' "$VALUE" || printf '%s' "$DEFAULT_VALUE"
+	fi
+}
+tui_mode() {
+	if command -v whiptail >/dev/null 2>&1; then
+		whiptail --title "IPv4 mode" --menu "Choose the IPv4 mode." 12 60 2 static "Static address" dhcp "DHCP IPv4" 3>&1 1>/dev/tty 2>&3 </dev/tty
+	elif command -v dialog >/dev/null 2>&1; then
+		dialog --stdout --title "IPv4 mode" --menu "Choose the IPv4 mode." 12 60 2 static "Static address" dhcp "DHCP IPv4" </dev/tty >/dev/tty
+	else
+		printf 'IPv4 mode: 1) static  2) dhcp [1]: ' >/dev/tty
+		IFS= read -r VALUE </dev/tty || die "input could not be read"
+		case "$VALUE" in 2 | dhcp) printf dhcp ;; *) printf static ;; esac
+	fi
+}
+tui_confirm() {
+	PROMPT=$1
+	if command -v whiptail >/dev/null 2>&1; then
+		whiptail --title "Confirm" --yesno "$PROMPT" 12 78 </dev/tty >/dev/tty
+	elif command -v dialog >/dev/null 2>&1; then
+		dialog --title "Confirm" --yesno "$PROMPT" 12 78 </dev/tty >/dev/tty
+	else
+		printf '%s [y/N] ' "$PROMPT" >/dev/tty
+		IFS= read -r VALUE </dev/tty || return 1
+		case "$VALUE" in y | Y | yes | YES) return 0 ;; *) return 1 ;; esac
+	fi
+}
+interactive_config() {
+	tty_available || die "interactive input needs /dev/tty; provide complete options or run: sudo sh /tmp/inet"
+	SUMMARY=$(show_interfaces)
+	tui_message "System and interfaces" "$SUMMARY"
+	DEFAULT=$(default_iface)
+	IFACE=$(tui_input "Interface" "Enter an interface shown above." "$DEFAULT")
+	validate_iface_name "$IFACE" || die "invalid interface name: $IFACE"
+	iface_exists "$IFACE" || die "interface does not exist: $IFACE"
+	detect_backend
+	is_plain_ethernet || die "$IFACE is not a supported plain Ethernet interface"
+	read_current
+	MODE=$(tui_mode)
+	if [ "$MODE" = static ]; then
+		ADDRESS=$(tui_input "Static IPv4" "IPv4 address with CIDR prefix." "$CURRENT_PRIMARY")
+		GATEWAY=$(tui_input "Gateway" "Default gateway IPv4." "$CURRENT_GATEWAY")
+		DNS=$(tui_input "DNS" "Primary and optional secondary DNS, comma-separated." "$CURRENT_DNS")
+		SEARCH=$(tui_input "DNS search" "Optional DNS search domain." "$CURRENT_SEARCH")
+	fi
+	METRIC=$(tui_input "Route metric" "Optional non-negative route metric." "$CURRENT_METRIC")
+	MTU=$(tui_input "MTU" "Optional MTU from 576 through 9000." "$CURRENT_MTU")
+}
+
+append_secondary_yaml() {
+	printf '%s\n' "$SECONDARY" | awk -v primary="$1" 'NF && $0 != primary { print "        - " $0 }'
+}
+generate_netplan() {
+	printf 'network:\n  version: 2\n'
+	[ -z "$NETPLAN_RENDERER" ] || printf '  renderer: %s\n' "$NETPLAN_RENDERER"
+	printf '  ethernets:\n    %s:\n' "$IFACE"
+	if [ "$MODE" = static ]; then
+		printf '      dhcp4: false\n      addresses:\n        - %s\n' "$ADDRESS"
+		append_secondary_yaml "$ADDRESS"
+		printf '      routes:\n        - to: default\n          via: %s\n' "$GATEWAY"
+		[ -z "$METRIC" ] || printf '          metric: %s\n' "$METRIC"
+		printf '      nameservers:\n        addresses:\n'
+		OLD_IFS=$IFS
+		IFS=,
+		# Intentional splitting uses only the comma separator set above.
+		# shellcheck disable=SC2086
+		set -- $DNS
+		IFS=$OLD_IFS
+		for SERVER in "$@"; do printf '          - %s\n' "$SERVER"; done
+		[ -z "$SEARCH" ] || printf '        search:\n          - %s\n' "$SEARCH"
+	else
+		printf '      dhcp4: true\n'
+		if [ -n "$METRIC" ]; then printf '      dhcp4-overrides:\n        route-metric: %s\n' "$METRIC"; fi
+		if [ -n "$SECONDARY" ]; then
+			printf '      addresses:\n'
+			append_secondary_yaml ""
+		else printf '      addresses: []\n'; fi
+	fi
+	[ -z "$MTU" ] || printf '      mtu: %s\n' "$MTU"
+}
+has_activation_directive() {
+	for FILE in $IF_FILES; do
+		awk -v target="$IFACE" '($1 == "auto" || $1 ~ /^allow-/) { for (i=2;i<=NF;i++) if ($i == target) found=1 } END { exit !found }' "$FILE" && return 0
+	done
+	return 1
+}
+ifup_stanza() {
+	[ "$HAS_ACTIVATION" -eq 1 ] || printf 'auto %s\n' "$IFACE"
+	printf 'iface %s inet %s\n' "$IFACE" "$MODE"
+	if [ "$MODE" = static ]; then
+		printf '    address %s\n    gateway %s\n' "$ADDRESS" "$GATEWAY"
+		printf '    dns-nameservers %s\n' "$(printf '%s' "$DNS" | tr ',' ' ')"
+		[ -z "$SEARCH" ] || printf '    dns-search %s\n' "$SEARCH"
+	fi
+	[ -z "$METRIC" ] || printf '    metric %s\n' "$METRIC"
+	[ -z "$MTU" ] || printf '    mtu %s\n' "$MTU"
+	printf '%s\n' "$SECONDARY" | awk -v target="$IFACE" -v primary="$ADDRESS" 'NF && $0 != primary { print "    up ip address add " $0 " dev " target " || true"; print "    down ip address del " $0 " dev " target " || true" }'
+}
+generate_ifupdown() {
+	STANZA=$(ifup_stanza)
+	if [ -f "$CONFIG_FILE" ]; then
+		[ "$(if_file_stanza_count "$CONFIG_FILE")" -le 1 ] || die "$CONFIG_FILE contains duplicate IPv4 stanzas for $IFACE"
+		awk -v target="$IFACE" -v stanza="$STANZA" '
+			function target_start() { return $1 == "iface" && $2 == target && $3 == "inet" }
+			{
+				if (skip && $0 ~ /^(auto|allow-[^[:space:]]+|iface|mapping|source|source-directory|rename)[[:space:]]/) skip=0
+				if (skip && $0 ~ /^#/) { comments=comments (comments ? "\n" : "") $0; next }
+				if (!skip && target_start()) { print stanza; skip=1; replaced=1; next }
+				if (!skip) { if (comments) { print comments; comments="" }; print }
+			}
+			END { if (comments) print comments; if (!replaced) { if (NR) print ""; print stanza } }
+		' "$CONFIG_FILE"
+	else
+		printf '%s\n' "$STANZA"
+	fi
+}
+build_candidate() {
+	if [ "$BACKEND" = netplan ]; then
+		CANDIDATE_CONTENT=$(generate_netplan)
+	else
+		load_interfaces_files
+		HAS_ACTIVATION=0
+		has_activation_directive && HAS_ACTIVATION=1
+		if [ "$MODE" = static ] && ! command -v resolvconf >/dev/null 2>&1; then
+			die "persistent ifupdown DNS requires resolvconf; /etc/resolv.conf will not be edited"
+		fi
+		CANDIDATE_CONTENT=$(generate_ifupdown)
+	fi
+}
+candidate_matches() {
+	[ -f "$CONFIG_FILE" ] || return 1
+	EXISTING=$(cat "$CONFIG_FILE")
+	[ "$EXISTING" = "$CANDIDATE_CONTENT" ]
+}
+runtime_matches() {
+	STATE=$(current_state "$IFACE" 2>/dev/null || :)
+	[ "$STATE" = UP ] || return 1
+	if [ "$MODE" = static ]; then
+		current_addresses | awk -v wanted="$ADDRESS" '$0 == wanted { found=1 } END { exit !found }' || return 1
+		[ "$(current_gateway)" = "$GATEWAY" ] || return 1
+	else
+		current_addresses | awk 'NF { found=1 } END { exit !found }' || return 1
+	fi
+	if [ -n "$METRIC" ]; then [ "$(current_metric)" = "$METRIC" ] || return 1; fi
+	if [ -n "$MTU" ]; then [ "$(current_mtu)" = "$MTU" ] || return 1; fi
+	return 0
+}
+review_text() {
+	OLD_ADDR=${CURRENT_PRIMARY:--}
+	NEW_ADDR=DHCP
+	[ "$MODE" = static ] && NEW_ADDR=$ADDRESS
+	printf '%s\n' \
+		"System: $OS_ID $OS_VERSION" \
+		"Backend: $BACKEND" \
+		"Interface: $IFACE" \
+		"File: $CONFIG_FILE" \
+		"" \
+		"Old: address=$OLD_ADDR gateway=${CURRENT_GATEWAY:--} dns=${CURRENT_DNS:--} metric=${CURRENT_METRIC:--} mtu=${CURRENT_MTU:--}" \
+		"New: mode=$MODE address=$NEW_ADDR gateway=${GATEWAY:--} dns=${DNS:--} search=${SEARCH:--} metric=${METRIC:--} mtu=${MTU:--}"
+	if [ -n "$SECONDARY" ]; then printf 'Preserved secondary IPv4:\n%s\n' "$SECONDARY"; fi
+}
+
+acquire_lock() {
+	mkdir -p "$RUN"
+	chmod 0700 "$RUN"
+	if mkdir "$RUN/lock" 2>/dev/null; then
+		LOCK_HELD=1
+		printf '%s\n' "$$" >"$RUN/lock/pid"
+		chmod 0600 "$RUN/lock/pid"
+		return
+	fi
+	LOCK_TOKEN=$(cat "$RUN/lock/token" 2>/dev/null || :)
+	if validate_token "$LOCK_TOKEN" && [ -d "$RUN/$LOCK_TOKEN" ]; then
+		die "another network transaction is pending confirmation"
+	fi
+	LOCK_PID=$(cat "$RUN/lock/pid" 2>/dev/null || :)
+	case "$LOCK_PID" in "" | *[!0123456789]*) ;; *) kill -0 "$LOCK_PID" 2>/dev/null && die "another network transaction is active" ;; esac
+	rm -rf "$RUN/lock"
+	mkdir "$RUN/lock" || die "could not acquire the network transaction lock"
+	LOCK_HELD=1
+	printf '%s\n' "$$" >"$RUN/lock/pid"
+	chmod 0600 "$RUN/lock/pid"
+}
+generate_token() {
+	command -v od >/dev/null 2>&1 || die "od is required to create a secure confirmation token"
+	TOKEN=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
+	validate_token "$TOKEN" || die "could not create a secure confirmation token"
+	printf '%s' "$TOKEN"
+}
+record_runtime() {
+	{
+		printf 'interface=%s\n' "$IFACE"
+		printf 'link=%s\n' "$(current_state "$IFACE")"
+		printf 'addresses:\n%s\n' "$(current_addresses)"
+		printf 'routes:\n'
+		ip -4 route show dev "$IFACE" 2>/dev/null || :
+		printf 'dns=%s\nsearch=%s\nmtu=%s\n' "$CURRENT_DNS" "$CURRENT_SEARCH" "$CURRENT_MTU"
+	} >"$BACKUP/old-runtime"
+}
+create_backup() {
+	mkdir -p "$BACKUP_PARENT"
+	BACKUP=$(mktemp -d "$BACKUP_PARENT/essential-inet.XXXXXXXX")
+	chmod 0700 "$BACKUP"
+	if [ -f "$CONFIG_FILE" ]; then
+		cp -p "$CONFIG_FILE" "$BACKUP/old-config"
+		stat -c 'mode=%a uid=%u gid=%g' "$CONFIG_FILE" >"$BACKUP/old-config.metadata"
+	else
+		: >"$BACKUP/config.absent"
+	fi
+	printf '%s\n' "$CANDIDATE_CONTENT" >"$BACKUP/new-config"
+	chmod 0600 "$BACKUP/new-config"
+	CREATED=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+	{
+		printf 'essential-inet-backup: 1\n'
+		printf 'created: %s\nbackend: %s\ninterface: %s\nconfig: %s\n' "$CREATED" "$BACKEND" "$IFACE" "$CONFIG_FILE"
+		printf 'old-address: %s\nold-gateway: %s\nold-dns: %s\nold-mtu: %s\n' "$CURRENT_PRIMARY" "$CURRENT_GATEWAY" "$CURRENT_DNS" "$CURRENT_MTU"
+		printf 'new-mode: %s\nnew-address: %s\nnew-gateway: %s\nnew-dns: %s\n' "$MODE" "$ADDRESS" "$GATEWAY" "$DNS"
+	} >"$BACKUP/manifest"
+	record_runtime
+	cp "$SELF" "$BACKUP/inet"
+	chmod 0700 "$BACKUP/inet"
+	printf '#!/usr/bin/env sh\nset -eu\nexec /bin/sh "%s/inet" --rollback "%s"\n' "$BACKUP" "$BACKUP" >"$BACKUP/rollback"
+	chmod 0700 "$BACKUP/rollback"
+}
+atomic_install() {
+	CONFIG_DIR=${CONFIG_FILE%/*}
+	mkdir -p "$CONFIG_DIR"
+	TEMP_CONFIG=$(mktemp "$CONFIG_DIR/.essential-inet.XXXXXX")
+	printf '%s\n' "$CANDIDATE_CONTENT" >"$TEMP_CONFIG"
+	if [ -f "$CONFIG_FILE" ]; then
+		META=$(stat -c '%a %u %g' "$CONFIG_FILE")
+		# Intentional splitting parses the three numeric stat fields.
+		# shellcheck disable=SC2086
+		set -- $META
+		chmod "$1" "$TEMP_CONFIG"
+		chown "$2:$3" "$TEMP_CONFIG"
+	elif [ "$BACKEND" = netplan ]; then
+		chmod 0600 "$TEMP_CONFIG"
+	else
+		chmod 0644 "$TEMP_CONFIG"
+	fi
+	mv "$TEMP_CONFIG" "$CONFIG_FILE"
+	TEMP_CONFIG=
+	MUTATED=1
+}
+validate_backend_config() {
+	if [ "$BACKEND" = netplan ]; then
+		netplan generate
+	elif command -v ifquery >/dev/null 2>&1 && command -v ifreload >/dev/null 2>&1; then
+		ifquery "$IFACE" >/dev/null
+	elif command -v ifup >/dev/null 2>&1; then
+		ifup --no-act "$IFACE" >/dev/null
+	else
+		return 1
+	fi
+}
+apply_backend() {
+	if [ "$BACKEND" = netplan ]; then
+		if [ "$NATIVE_TRY" -eq 1 ]; then netplan try --timeout "$ROLLBACK_TIMEOUT"; else netplan apply; fi
+	else
+		ifdown "$IFACE" 2>/dev/null || :
+		ifup "$IFACE"
+	fi
+}
+apply_backend_rollback() {
+	if [ "$BACKEND" = netplan ]; then
+		netplan generate && netplan apply
+	elif command -v ifquery >/dev/null 2>&1 && command -v ifreload >/dev/null 2>&1; then
+		ifquery "$IFACE" >/dev/null || return 1
+		ifdown "$IFACE" 2>/dev/null || :
+		ifup "$IFACE"
+	else
+		ifup --no-act "$IFACE" >/dev/null || return 1
+		ifdown "$IFACE" 2>/dev/null || :
+		ifup "$IFACE"
+	fi
+}
+start_watchdog() {
+	command -v nohup >/dev/null 2>&1 || die "nohup is required for rollback protection"
+	TRANSACTION_TOKEN=$(generate_token)
+	TRANSACTION_DIR=$RUN/$TRANSACTION_TOKEN
+	mkdir "$TRANSACTION_DIR"
+	PENDING=1
+	chmod 0700 "$TRANSACTION_DIR"
+	printf '%s\n' "$BACKUP" >"$TRANSACTION_DIR/backup"
+	chmod 0600 "$TRANSACTION_DIR/backup"
+	cp "$SELF" "$RUN/inet"
+	chmod 0700 "$RUN/inet"
+	printf '%s\n' "$TRANSACTION_TOKEN" >"$RUN/lock/token"
+	chmod 0600 "$RUN/lock/token"
+	ESSENTIAL_TEST_ROOT=$ROOT ESSENTIAL_INET_WATCHDOG_TIMEOUT=$ROLLBACK_TIMEOUT nohup /bin/sh "$RUN/inet" --watchdog "$TRANSACTION_TOKEN" >"$BACKUP/watchdog.log" 2>&1 &
+	WATCHDOG_PID=$!
+	printf '%s\n' "$WATCHDOG_PID" >"$TRANSACTION_DIR/pid"
+	chmod 0600 "$TRANSACTION_DIR/pid"
+}
+stop_watchdog() {
+	TOKEN=$1
+	TX=$RUN/$TOKEN
+	[ -d "$TX" ] || return 0
+	if [ -f "$TX/rolling-back" ]; then die "rollback has already started; wait for it to finish"; fi
+	: >"$TX/confirmed"
+	chmod 0600 "$TX/confirmed"
+	PID=$(cat "$TX/pid" 2>/dev/null || :)
+	case "$PID" in "" | *[!0123456789]*) ;; *) kill "$PID" 2>/dev/null || : ;; esac
+	sleep 1
+	rm -rf "$TX" "$RUN/lock"
+	PENDING=0
+	LOCK_HELD=0
+}
+validate_backup() {
+	BACKUP_TO_CHECK=$1
+	case "$BACKUP_TO_CHECK" in "$BACKUP_PARENT"/essential-inet.*) ;; *) return 1 ;; esac
+	case "/$BACKUP_TO_CHECK/" in *'/../'* | *'/./'*) return 1 ;; esac
+	[ -d "$BACKUP_TO_CHECK" ] && [ ! -L "$BACKUP_TO_CHECK" ] || return 1
+	[ -f "$BACKUP_TO_CHECK/manifest" ] || return 1
+	awk 'NR == 1 && $0 == "essential-inet-backup: 1" { ok=1 } END { exit !ok }' "$BACKUP_TO_CHECK/manifest"
+}
+manifest_value() {
+	awk -v key="$2" 'index($0, key ": ") == 1 { sub("^[^:]*: ", ""); print; exit }' "$1/manifest"
+}
+restore_file() {
+	RESTORE_BACKUP=$1
+	RESTORE_CONFIG=$2
+	RESTORE_DIR=${RESTORE_CONFIG%/*}
+	mkdir -p "$RESTORE_DIR"
+	if [ -f "$RESTORE_BACKUP/config.absent" ]; then
+		rm -f "$RESTORE_CONFIG"
+	else
+		RESTORE_TEMP=$(mktemp "$RESTORE_DIR/.essential-inet-rollback.XXXXXX")
+		cp -p "$RESTORE_BACKUP/old-config" "$RESTORE_TEMP"
+		mv "$RESTORE_TEMP" "$RESTORE_CONFIG"
+	fi
+}
+rollback_backup() {
+	ROLLBACK_BACKUP=$1
+	ROLLBACK_KIND=$2
+	validate_backup "$ROLLBACK_BACKUP" || return 1
+	BACKEND=$(manifest_value "$ROLLBACK_BACKUP" backend)
+	IFACE=$(manifest_value "$ROLLBACK_BACKUP" interface)
+	CONFIG_FILE=$(manifest_value "$ROLLBACK_BACKUP" config)
+	case "$BACKEND" in netplan | ifupdown) ;; *) return 1 ;; esac
+	validate_iface_name "$IFACE" || return 1
+	case "$CONFIG_FILE" in "$ETC"/*) ;; *) return 1 ;; esac
+	restore_file "$ROLLBACK_BACKUP" "$CONFIG_FILE"
+	apply_backend_rollback || return 1
+	iface_exists "$IFACE" || return 1
+	OLD_ADDRESS=$(manifest_value "$ROLLBACK_BACKUP" old-address)
+	if [ -n "$OLD_ADDRESS" ]; then
+		ip -o -4 addr show dev "$IFACE" | awk -v wanted="$OLD_ADDRESS" '{ for(i=1;i<=NF;i++) if($i=="inet" && $(i+1)==wanted) found=1 } END { exit !found }' || return 1
+	fi
+	OLD_GATEWAY=$(manifest_value "$ROLLBACK_BACKUP" old-gateway)
+	if [ -n "$OLD_GATEWAY" ]; then [ "$(current_gateway)" = "$OLD_GATEWAY" ] || return 1; fi
+	OLD_MTU=$(manifest_value "$ROLLBACK_BACKUP" old-mtu)
+	if [ -n "$OLD_MTU" ]; then [ "$(current_mtu)" = "$OLD_MTU" ] || return 1; fi
+	log "Rollback verified ($ROLLBACK_KIND): $ROLLBACK_BACKUP"
+	return 0
+}
+confirm_action() {
+	validate_token "$ACTION_VALUE" || die "invalid confirmation token"
+	require_root --confirm "$ACTION_VALUE"
+	TX=$RUN/$ACTION_VALUE
+	[ -d "$TX" ] || die "confirmation token is not active"
+	BACKUP=$(cat "$TX/backup" 2>/dev/null || :)
+	validate_backup "$BACKUP" || die "confirmation state is invalid"
+	stop_watchdog "$ACTION_VALUE"
+	log "Configuration accepted. Backup retained: $BACKUP"
+}
+rollback_action() {
+	require_root --rollback "$ACTION_VALUE"
+	validate_backup "$ACTION_VALUE" || die "not an essential-inet backup directory"
+	rollback_backup "$ACTION_VALUE" manual || die "rollback failed; inspect $ACTION_VALUE"
+	if [ -f "$RUN/lock/token" ]; then
+		TOKEN=$(cat "$RUN/lock/token")
+		if validate_token "$TOKEN"; then stop_watchdog "$TOKEN"; fi
+	fi
+}
+watchdog_action() {
+	validate_token "$ACTION_VALUE" || die "invalid confirmation token"
+	[ "$#" -eq 1 ] || die "watchdog timeout is missing"
+	TIMEOUT=$1
+	case "$TIMEOUT" in "" | *[!0123456789]*) die "invalid watchdog timeout" ;; esac
+	TX=$RUN/$ACTION_VALUE
+	[ -d "$TX" ] || exit 0
+	WAITED=0
+	while [ ! -f "$TX/armed" ]; do
+		[ -f "$TX/confirmed" ] && exit 0
+		PID=$(cat "$RUN/lock/pid" 2>/dev/null || :)
+		case "$PID" in "" | *[!0123456789]*) break ;; esac
+		kill -0 "$PID" 2>/dev/null || break
+		if [ "$WAITED" -ge "$TIMEOUT" ]; then
+			: >"$TX/rolling-back"
+			chmod 0600 "$TX/rolling-back"
+			kill "$PID" 2>/dev/null || :
+			sleep 1
+			break
+		fi
+		sleep 1
+		WAITED=$((WAITED + 1))
+	done
+	[ -f "$TX/armed" ] && sleep "$TIMEOUT"
+	[ -f "$TX/confirmed" ] && exit 0
+	if [ ! -f "$TX/rolling-back" ]; then
+		: >"$TX/rolling-back"
+		chmod 0600 "$TX/rolling-back"
+	fi
+	[ -f "$TX/confirmed" ] && exit 0
+	BACKUP=$(cat "$TX/backup" 2>/dev/null || :)
+	if rollback_backup "$BACKUP" watchdog; then
+		rm -rf "$TX" "$RUN/lock"
+		exit 0
+	fi
+	warn "watchdog rollback failed: $BACKUP"
+	exit 1
+}
+
+verify_runtime() {
+	FAIL=
+	iface_exists "$IFACE" || FAIL="$FAIL interface-missing"
+	STATE=$(current_state "$IFACE" 2>/dev/null || :)
+	[ "$STATE" = UP ] || FAIL="$FAIL link-not-up"
+	if [ "$MODE" = static ]; then
+		ip -o -4 addr show dev "$IFACE" | awk -v wanted="$ADDRESS" '{ for(i=1;i<=NF;i++) if($i=="inet" && $(i+1)==wanted) found=1 } END { exit !found }' || FAIL="$FAIL address-mismatch"
+		ROUTE=$(ip -4 route show default dev "$IFACE" 2>/dev/null || :)
+		printf '%s\n' "$ROUTE" | awk -v gw="$GATEWAY" -v dev="$IFACE" '
+			$1=="default" { for(i=1;i<=NF;i++){if($i=="via" && $(i+1)==gw) vg=1;if($i=="dev" && $(i+1)==dev) vd=1} if(vg&&vd) ok=1 }
+			END { exit !ok }' || FAIL="$FAIL default-route-mismatch"
+	else
+		TRIES=0
+		while [ "$TRIES" -lt 10 ]; do
+			DHCP_PRIMARY=$(current_addresses | awk 'NF { print; exit }')
+			DHCP_GATEWAY=$(current_gateway)
+			if [ -n "$DHCP_PRIMARY" ] && [ -n "$DHCP_GATEWAY" ]; then break; fi
+			sleep 1
+			TRIES=$((TRIES + 1))
+		done
+		DHCP_PRIMARY=$(current_addresses | awk 'NF { print; exit }')
+		DHCP_GATEWAY=$(current_gateway)
+		[ -n "$DHCP_PRIMARY" ] || FAIL="$FAIL dhcp-address-missing"
+		[ -n "$DHCP_GATEWAY" ] || FAIL="$FAIL dhcp-default-route-missing"
+	fi
+	if [ -n "$METRIC" ]; then [ "$(current_metric)" = "$METRIC" ] || FAIL="$FAIL metric-mismatch"; fi
+	if [ -n "$MTU" ]; then [ "$(current_mtu)" = "$MTU" ] || FAIL="$FAIL mtu-mismatch"; fi
+	validate_backend_config || FAIL="$FAIL backend-validation"
+	[ -z "$FAIL" ] || {
+		warn "critical verification failed:$FAIL"
+		return 1
+	}
+	if [ -n "$GATEWAY" ] && command -v ping >/dev/null 2>&1; then
+		ping -c 1 -W 2 "$GATEWAY" >/dev/null 2>&1 || warn "gateway did not answer ping; ICMP may be filtered"
+	fi
+	if [ "$MODE" = static ] && command -v resolvectl >/dev/null 2>&1; then
+		ACTIVE_DNS=$(resolvectl dns "$IFACE" 2>/dev/null || :)
+		OLD_IFS=$IFS
+		IFS=,
+		# Intentional splitting uses only the comma separator set above.
+		# shellcheck disable=SC2086
+		set -- $DNS
+		IFS=$OLD_IFS
+		for SERVER in "$@"; do case "$ACTIVE_DNS" in *"$SERVER"*) ;; *) warn "DNS server $SERVER is configured but not reported by resolvectl" ;; esac done
+	fi
+	if command -v getent >/dev/null 2>&1; then getent hosts example.com >/dev/null 2>&1 || warn "optional DNS resolution check failed"; fi
+	return 0
+}
+warn_route_conflict() {
+	OTHER_DEFAULTS=$(ip -4 route show default 2>/dev/null | awk -v target="$IFACE" '{ dev=""; for(i=1;i<=NF;i++) if($i=="dev") dev=$(i+1); if(dev!="" && dev!=target) print }')
+	[ -z "$OTHER_DEFAULTS" ] || warn "another default route exists and will be retained: $OTHER_DEFAULTS"
+}
+duplicate_check() {
+	[ "$MODE" = static ] || return 0
+	command -v arping >/dev/null 2>&1 || return 0
+	IP_PART=${ADDRESS%/*}
+	if ! arping -D -c 2 -I "$IFACE" "$IP_PART" >/dev/null 2>&1; then warn "arping saw a possible duplicate IPv4 address: $IP_PART"; fi
+}
+
+case "$ACTION" in
+confirm)
+	[ "$SHOW$DRY_RUN$YES$IFACE$MODE$ADDRESS$GATEWAY$DNS$SEARCH$METRIC$MTU" = 000 ] || die "--confirm cannot be combined with configuration options"
+	confirm_action
+	exit 0
+	;;
+rollback)
+	[ "$SHOW$DRY_RUN$YES$IFACE$MODE$ADDRESS$GATEWAY$DNS$SEARCH$METRIC$MTU" = 000 ] || die "--rollback cannot be combined with configuration options"
+	rollback_action
+	exit 0
+	;;
+watchdog)
+	watchdog_action "${ESSENTIAL_INET_WATCHDOG_TIMEOUT:-120}"
+	;;
+esac
+
+command -v ip >/dev/null 2>&1 || die "ip is required"
+if [ "$SHOW" -eq 1 ]; then
+	[ -z "$MODE$ADDRESS$GATEWAY$DNS$SEARCH$METRIC$MTU" ] || die "--show cannot be combined with configuration options"
+	if [ -n "$IFACE" ]; then
+		validate_iface_name "$IFACE" || die "invalid or missing interface: $IFACE"
+		iface_exists "$IFACE" || die "invalid or missing interface: $IFACE"
+	fi
+	show_interfaces
+	exit 0
+fi
+if [ -z "$MODE" ]; then
+	[ "$YES" -eq 0 ] || die "--yes requires complete non-interactive configuration"
+	if [ "$DRY_RUN" -eq 1 ]; then
+		show_interfaces
+		exit 0
+	fi
+	[ -z "$IFACE$ADDRESS$GATEWAY$DNS$SEARCH$METRIC$MTU" ] || die "--mode is required with configuration options"
+	interactive_config
+fi
+validate_options
+detect_backend
+is_plain_ethernet || die "$IFACE is not a supported plain Ethernet interface"
+read_os_release
+read_current
+build_candidate
+REVIEW=$(review_text)
+log "$REVIEW"
+candidate_matches && runtime_matches && {
+	log "Verified: requested configuration is already present; no changes or backup needed."
+	exit 0
+}
+warn_route_conflict
+if [ "$DRY_RUN" -eq 1 ]; then
+	log "Dry run candidate:"
+	printf '%s\n' "$CANDIDATE_CONTENT"
+	exit 0
+fi
+[ "$YES" -eq 0 ] || [ -n "$IFACE$MODE" ] || die "--yes requires complete non-interactive configuration"
+if [ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}" ]; then
+	warn "this SSH connection may disconnect; unconfirmed changes roll back automatically"
+	log "New IPv4: ${ADDRESS:-DHCP}"
+fi
+if [ "$YES" -eq 0 ]; then
+	tty_available || die "confirmation needs /dev/tty; rerun with complete options and --yes"
+	tui_message "Review" "$REVIEW\n\nFile to change: $CONFIG_FILE"
+	tui_confirm "Apply this network configuration with automatic rollback protection?" || die "cancelled; nothing changed"
+fi
+elevate_configuration() {
+	set -- --interface "$IFACE" --mode "$MODE"
+	if [ -n "$ADDRESS" ]; then set -- "$@" --address "$ADDRESS"; fi
+	if [ -n "$GATEWAY" ]; then set -- "$@" --gateway "$GATEWAY"; fi
+	if [ -n "$DNS" ]; then set -- "$@" --dns "$DNS"; fi
+	if [ -n "$SEARCH" ]; then set -- "$@" --search "$SEARCH"; fi
+	if [ -n "$METRIC" ]; then set -- "$@" --metric "$METRIC"; fi
+	if [ -n "$MTU" ]; then set -- "$@" --mtu "$MTU"; fi
+	if [ "$YES" -eq 1 ]; then set -- "$@" --yes; fi
+	require_root "$@"
+}
+elevate_configuration
+ROLLBACK_TIMEOUT=${ESSENTIAL_INET_TIMEOUT:-120}
+case "$ROLLBACK_TIMEOUT" in "" | *[!0123456789]*) die "invalid rollback timeout" ;; esac
+decimal_le "$ROLLBACK_TIMEOUT" 86400 || die "invalid rollback timeout"
+[ "$ROLLBACK_TIMEOUT" -ge 1 ] || die "invalid rollback timeout"
+acquire_lock
+duplicate_check
+create_backup
+atomic_install
+if ! validate_backend_config; then
+	warn "candidate configuration failed validation; applying it was skipped"
+	rollback_backup "$BACKUP" candidate-failure || warn "file rollback failed: $BACKUP"
+	[ "$PENDING" -eq 0 ] || stop_watchdog "$TRANSACTION_TOKEN"
+	die "candidate validation failed"
+fi
+NATIVE_TRY=0
+if [ "$BACKEND" = netplan ] && [ "$YES" -eq 0 ] && [ -z "${SSH_CONNECTION:-}${SSH_CLIENT:-}" ] && interactive_tty; then
+	NATIVE_TRY=1
+else
+	start_watchdog
+fi
+if ! apply_backend; then
+	warn "network apply failed; rolling back"
+	rollback_backup "$BACKUP" apply-failure || warn "automatic rollback failed: $BACKUP"
+	[ "$PENDING" -eq 0 ] || stop_watchdog "$TRANSACTION_TOKEN"
+	die "network apply failed"
+fi
+if [ "$NATIVE_TRY" -eq 1 ]; then
+	if ! tui_confirm "Keep and permanently apply the candidate tested by netplan try?"; then
+		rollback_backup "$BACKUP" netplan-try-rejected || die "rollback failed; use console and $BACKUP/rollback"
+		die "netplan try was not accepted"
+	fi
+	NATIVE_TRY=0
+	if ! apply_backend; then
+		rollback_backup "$BACKUP" netplan-final-apply-failure || die "rollback failed; use console and $BACKUP/rollback"
+		die "final netplan apply failed"
+	fi
+else
+	: >"$TRANSACTION_DIR/armed"
+	chmod 0600 "$TRANSACTION_DIR/armed"
+fi
+if ! verify_runtime; then
+	warn "post-apply verification failed; rolling back"
+	rollback_backup "$BACKUP" verification-failure || warn "automatic rollback failed: $BACKUP"
+	[ "$PENDING" -eq 0 ] || stop_watchdog "$TRANSACTION_TOKEN"
+	die "post-apply verification failed"
+fi
+MUTATED=0
+log "Verified: link, IPv4, route, and backend configuration are valid."
+log "Backup: $BACKUP"
+if [ -z "${SSH_CONNECTION:-}${SSH_CLIENT:-}" ] && interactive_tty; then
+	log "Rollback watchdog countdown: $ROLLBACK_TIMEOUT seconds"
+	if tui_confirm "Keep the new configuration? Unconfirmed changes will roll back."; then
+		stop_watchdog "$TRANSACTION_TOKEN"
+		log "Configuration accepted. Backup retained: $BACKUP"
+	else
+		rollback_backup "$BACKUP" user-request || die "rollback failed; use console and $BACKUP/rollback"
+		stop_watchdog "$TRANSACTION_TOKEN"
+	fi
+else
+	log "Rollback watchdog countdown: $ROLLBACK_TIMEOUT seconds"
+	log "Confirm with: sudo /bin/sh $RUN/inet --confirm $TRANSACTION_TOKEN"
+	log "The transaction remains pending. Confirm from the new address before the timeout."
+fi
