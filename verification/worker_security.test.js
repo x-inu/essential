@@ -462,7 +462,8 @@ test("index uses one commit and shows simple direct commands for every tool", as
   assert.match(html, /\.command-row\{display:grid;grid-template-columns:minmax\(0,1fr\) auto/);
   assert.match(html, /\.readout--rows \.rot\{min-width:0\}/);
   assert.match(html, /\.quick-command\{display:block;white-space:nowrap;overflow-x:auto\}/);
-  assert.match(html, /<span class="quick-command">.*?id="rot".*? \| sh<\/span><\/span>/);
+  assert.match(html, /<span class="quick-command"><span class="prompt">\$ <\/span><span class="hl">curl -fsSL https:\/\/raw\.xinu\.my\.id\/&lt;name&gt; \| sh<\/span><\/span>/);
+  assert.doesNotMatch(html, /id="rot"/);
   assert.match(html, /<span class="rot" id="rot3">.*?<\/span><span class="hl"> \| sh<\/span>/);
   assert.doesNotMatch(html, /sha256sum -c -/);
   assert.doesNotMatch(html, /mktemp/);
@@ -475,7 +476,8 @@ test("index uses one commit and shows simple direct commands for every tool", as
   assert.match(html, /:focus-visible/);
   assert.match(html, /--max:1080px/);
   assert.match(html, /--wide:1440px/);
-  assert.match(html, /localStorage/);
+  assert.doesNotMatch(html, /Motion: (?:on|off)/);
+  assert.doesNotMatch(html, /localStorage/);
   assert.match(html, /rotFadeReduced/);
   assert.doesNotMatch(html, /!important/);
   assert.doesNotMatch(html, / style="/);
