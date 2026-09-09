@@ -12,6 +12,8 @@ import worker, {
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
 const OTHER_SHA = "89abcdef0123456789abcdef0123456789abcdef";
+const stylesheet = await readFile(new URL("../public/style.css", import.meta.url), "utf8");
+const browserScript = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 const manifest = {
   cinit: {
     source: "tools/cinit",
@@ -468,8 +470,13 @@ test("index uses one commit and shows simple direct commands for every tool", as
   const response = await dispatch(new Request("https://raw.xinu.my.id/?test=1"));
   const html = await body(response);
   assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-security-policy"), /script-src 'nonce-[A-Za-z0-9_-]+'/);
-  assert.match(response.headers.get("content-security-policy"), /style-src 'nonce-[A-Za-z0-9_-]+'/);
+  assert.match(response.headers.get("content-security-policy"), /script-src 'self'/);
+  assert.match(response.headers.get("content-security-policy"), /style-src 'self' https:\/\/fonts.googleapis.com/);
+  assert.doesNotMatch(response.headers.get("content-security-policy"), /nonce-/);
+  assert.match(html, /<link rel="stylesheet" href="\/style\.css">/);
+  assert.match(html, /<script src="\/app\.js" defer><\/script>/);
+  assert.doesNotMatch(html, /<style\b/);
+  assert.doesNotMatch(html, /<script(?:\s+(?!src=)[^>]*)?>/);
   assert.match(html, /href="\/sudo">Download latest/);
   assert.match(html, /curl -fsSL https:\/\/raw\.xinu\.my\.id\/cinit \| sh/);
   assert.match(html, /curl -fsSL https:\/\/raw\.xinu\.my\.id\/inet \| sh/);
@@ -481,9 +488,9 @@ test("index uses one commit and shows simple direct commands for every tool", as
   assert.match(html, /serve text with edge caching/);
   assert.match(html, /# print it/);
   assert.match(html, /# then run it/);
-  assert.match(html, /\.command-row\{display:grid;grid-template-columns:minmax\(0,1fr\) auto/);
-  assert.match(html, /\.readout--rows \.rot\{min-width:0\}/);
-  assert.match(html, /\.quick-command\{display:block;white-space:nowrap;overflow-x:auto\}/);
+  assert.match(html, /data-tool-name="cinit"/);
+  assert.match(html, /data-tool-name="inet"/);
+  assert.match(html, /data-tool-name="sudo"/);
   assert.match(html, /<span class="quick-command"><span class="prompt">\$ <\/span><span class="hl">curl -fsSL https:\/\/raw\.xinu\.my\.id\/&lt;name&gt; \| sh<\/span><\/span>/);
   assert.doesNotMatch(html, /id="rot"/);
   assert.match(html, /<span class="rot" id="rot3">.*?<\/span><span class="hl"> \| sh<\/span>/);
@@ -492,16 +499,7 @@ test("index uses one commit and shows simple direct commands for every tool", as
   assert.doesNotMatch(html, /read -r answer/);
   assert.match(html, new RegExp(`github\\.com/x-inu/essential/blob/${SHA}/tools/sudo`));
   assert.match(html, /aria-live="polite"/);
-  assert.match(html, /Copy failed/);
   assert.match(html, /aria-hidden="true">RAW/);
-  assert.match(html, /scroll-margin-top/);
-  assert.match(html, /:focus-visible/);
-  assert.match(html, /--max:1080px/);
-  assert.match(html, /--wide:1440px/);
-  assert.doesNotMatch(html, /Motion: (?:on|off)/);
-  assert.doesNotMatch(html, /localStorage/);
-  assert.match(html, /rotFadeReduced/);
-  assert.doesNotMatch(html, /!important/);
   assert.doesNotMatch(html, / style="/);
   assert.doesNotMatch(html, /\/v\/[a-f0-9]{40}\/tools\//);
   assert.deepEqual(calls, [
@@ -511,6 +509,63 @@ test("index uses one commit and shows simple direct commands for every tool", as
     `https://raw.githubusercontent.com/x-inu/essential/${SHA}/tools/inet`,
     `https://raw.githubusercontent.com/x-inu/essential/${SHA}/tools/sudo`,
   ]);
+});
+
+test("frontend assets are separate, allowlisted, and hardened", async () => {
+  const calls = [];
+  const env = {
+    ASSETS: {
+      async fetch(request) {
+        const pathname = new URL(request.url).pathname;
+        calls.push(pathname);
+        if (pathname === "/style.css") {
+          return new Response(stylesheet, { headers: { "content-type": "text/css; charset=utf-8" } });
+        }
+        if (pathname === "/app.js") {
+          return new Response(browserScript, { headers: { "content-type": "text/javascript; charset=utf-8" } });
+        }
+        return new Response("missing", { status: 404 });
+      },
+    },
+  };
+
+  const css = await dispatch(new Request("https://raw.xinu.my.id/style.css?x=1"), env);
+  assert.equal(css.status, 200);
+  assert.equal(css.headers.get("content-type"), "text/css; charset=utf-8");
+  assert.equal(css.headers.get("cache-control"), "public, max-age=300, s-maxage=300");
+  assert.equal(css.headers.get("x-content-type-options"), "nosniff");
+  assert.match(await body(css), /\.command-row\s*\{[\s\S]*grid-template-columns: minmax\(0, 1fr\) auto/);
+  assert.match(stylesheet, /\.readout--rows \.rot\s*\{[\s\S]*min-width: 0/);
+  assert.match(stylesheet, /\.quick-command\s*\{[\s\S]*white-space: nowrap;[\s\S]*overflow-x: auto/);
+  assert.match(stylesheet, /scroll-margin-top/);
+  assert.match(stylesheet, /:focus-visible/);
+  assert.match(stylesheet, /--max: 1080px/);
+  assert.match(stylesheet, /--wide: 1440px/);
+  assert.match(stylesheet, /rotFadeReduced/);
+  assert.doesNotMatch(stylesheet, /!important/);
+
+  const script = await dispatch(new Request("https://raw.xinu.my.id/app.js"), env);
+  assert.equal(script.status, 200);
+  assert.equal(script.headers.get("content-type"), "text/javascript; charset=utf-8");
+  assert.match(await body(script), /querySelectorAll\("\[data-tool-name\]"\)/);
+  assert.match(browserScript, /navigator\.clipboard\.writeText/);
+  assert.match(browserScript, /Copy failed/);
+  assert.doesNotMatch(browserScript, /localStorage/);
+
+  const head = await dispatch(new Request("https://raw.xinu.my.id/app.js", { method: "HEAD" }), env);
+  assert.equal(head.status, 200);
+  assert.equal(await body(head), "");
+  assert.deepEqual(calls, ["/style.css", "/app.js", "/app.js"]);
+
+  const missingBinding = await dispatch(new Request("https://raw.xinu.my.id/style.css"));
+  assert.equal(missingBinding.status, 404);
+  assert.equal(await body(missingBinding), "not found\n");
+
+  const unavailable = await dispatch(new Request("https://raw.xinu.my.id/app.js"), {
+    ASSETS: { fetch: async () => { throw new Error("assets down"); } },
+  });
+  assert.equal(unavailable.status, 502);
+  assert.equal(await body(unavailable), "asset unavailable\n");
 });
 
 test("index escapes manifest HTML and safely encodes route segments", async (t) => {
