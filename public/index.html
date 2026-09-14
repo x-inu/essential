@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Two small shell tools served as static files from the Cloudflare edge.">
+  <meta name="color-scheme" content="dark">
+  <title>源 raw.xinu</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..600&amp;family=Space+Grotesk:wght@400;500&amp;family=Space+Mono:wght@400;700&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="hdr" id="hdr">
+    <div class="wide hdr__in">
+      <a class="logo" href="/"><span>源</span><span class="logo__t">raw.xinu.my.id</span></a>
+      <nav class="nav" aria-label="Primary">
+        <a href="#scripts">Tools</a>
+        <a href="https://github.com/x-inu/essential">Source</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="wrap hero__grid">
+        <div>
+          <p class="eyebrow"><span class="eyebrow__k">源</span> Tool index</p>
+          <div class="live"><span class="dot" aria-hidden="true"></span><span class="micro">Static files at the edge</span></div>
+          <h1>raw.xinu.my.id</h1>
+          <p class="lede">Two direct shell tools from <span class="mono">x-inu/essential</span>, delivered as ordinary static files.</p>
+          <div class="spec">
+            <div class="spec__row"><span class="spec__k">Source</span><span class="spec__lead"></span><span class="spec__v">x-inu/essential</span></div>
+            <div class="spec__row"><span class="spec__k">Tools</span><span class="spec__lead"></span><span class="spec__v">02</span></div>
+            <div class="spec__row"><span class="spec__k">Delivery</span><span class="spec__lead"></span><span class="spec__v">Static assets</span></div>
+          </div>
+        </div>
+        <div>
+          <p class="label usage-label">Quick use</p>
+          <div class="readout"><span class="quick-command"><span class="prompt">$ </span><span class="hl">curl -fsSL https://raw.xinu.my.id/&lt;name&gt; | sh</span></span></div>
+          <p class="micro usage-note">Choose a tool, read its source, then run it with the required privileges.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="scripts">
+      <div class="wrap">
+        <p class="eyebrow"><span class="eyebrow__k">具</span> Published</p>
+        <h2 class="stmt">Two tools, served directly as static files.</h2>
+
+        <article class="entry" data-tool-name="cinit">
+          <div>
+            <p class="entry__idx">00 // CINIT</p>
+            <div class="entry__head">
+              <h3 class="entry__name">止 &nbsp;Disable cloud-init networking</h3>
+              <p class="entry__meta">SHELL SCRIPT<br>DEBIAN · UBUNTU</p>
+            </div>
+          </div>
+          <p class="entry__note">Writes the cloud-init network configuration override used to disable network rendering.</p>
+          <div class="cmd">
+            <code class="cmd__text">curl -fsSL https://raw.xinu.my.id/cinit | sh</code>
+            <button class="cmd__btn" data-copy="curl -fsSL https://raw.xinu.my.id/cinit | sh" aria-describedby="copy-status-0" type="button">Copy</button>
+          </div>
+          <p class="copy-status" id="copy-status-0" role="status" aria-live="polite"></p>
+          <div class="links">
+            <a class="glink" href="https://github.com/x-inu/essential/blob/main/public/cinit">View source ↗</a>
+            <a class="glink" href="/cinit">Open file</a>
+          </div>
+        </article>
+
+        <article class="entry" data-tool-name="sudo">
+          <div>
+            <p class="entry__idx">01 // SUDO</p>
+            <div class="entry__head">
+              <h3 class="entry__name">権 &nbsp;Install sudo</h3>
+              <p class="entry__meta">SHELL SCRIPT<br>DEBIAN · UBUNTU</p>
+            </div>
+          </div>
+          <p class="entry__note">Installs sudo and grants sudo access to an existing local user.</p>
+          <div class="cmd">
+            <code class="cmd__text">curl -fsSL https://raw.xinu.my.id/sudo | sh</code>
+            <button class="cmd__btn" data-copy="curl -fsSL https://raw.xinu.my.id/sudo | sh" aria-describedby="copy-status-1" type="button">Copy</button>
+          </div>
+          <p class="copy-status" id="copy-status-1" role="status" aria-live="polite"></p>
+          <div class="links">
+            <a class="glink" href="https://github.com/x-inu/essential/blob/main/public/sudo">View source ↗</a>
+            <a class="glink" href="/sudo">Open file</a>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section id="how">
+      <div class="wrap two">
+        <div>
+          <p class="eyebrow"><span class="eyebrow__k">道</span> Direct path</p>
+          <h2 class="stmt">The URL maps directly to the file.</h2>
+        </div>
+        <div class="notes">
+          <div class="readout">GET https://raw.xinu.my.id/<span class="rot" id="rot4"><span class="rot__t">cinit</span></span>
+  <span class="comment">└─</span> serve public/<span class="rot" id="rot5"><span class="rot__t">cinit</span></span></div>
+          <div class="note"><p class="label">Static delivery</p><p>The deployed files are served directly by Cloudflare. The request does not call GitHub or render the page on the server.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="care">
+      <div class="wrap">
+        <p class="eyebrow"><span class="eyebrow__k">見</span> Before you run</p>
+        <div class="plate">
+          <h2 class="stmt">Read it before you trust it.</h2>
+          <p class="entry__note">These tools make system changes. Review the source and understand the requested privileges before running them.</p>
+          <div class="readout readout--rows">
+            <span class="command-row"><span class="command-row__code"><span class="prompt">$ </span><span class="hl">curl -fsSL https://raw.xinu.my.id/</span><span class="rot" id="rot2"><span class="rot__t">cinit</span></span></span><span class="comment"># print it</span></span>
+            <span class="command-row"><span class="command-row__code"><span class="prompt">$ </span><span class="hl">curl -fsSL https://raw.xinu.my.id/</span><span class="rot" id="rot3"><span class="rot__t">cinit</span></span><span class="hl"> | sh</span></span><span class="comment"># then run it</span></span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="ftr">
+    <div class="wide">
+      <div class="ftr__word" aria-hidden="true">RAW</div>
+      <div class="ftr__bar"><span>Two static tools · x-inu/essential</span><a href="https://github.com/x-inu/essential">github.com/x-inu/essential ↗</a><span>源 · raw.xinu.my.id</span></div>
+    </div>
+  </footer>
+</body>
+</html>

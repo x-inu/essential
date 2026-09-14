@@ -27,7 +27,7 @@ document.querySelectorAll("[data-copy]").forEach((button) => {
 const names = [...document.querySelectorAll("[data-tool-name]")].map(
   (entry) => entry.dataset.toolName,
 );
-const rotations = ["rot2", "rot3", "rot4"]
+const rotations = ["rot2", "rot3", "rot4", "rot5"]
   .map((id) => document.getElementById(id))
   .filter(Boolean);
 
