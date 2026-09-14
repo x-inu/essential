@@ -24,8 +24,10 @@ public/          static site and public tool files
   style.css      page styles
   app.js         copy controls and small interactions
   favicon.svg    site icon
-  cinit          cloud-init tool, available at /cinit
-  sudo           sudo tool, available at /sudo
+  _redirects     maps the short public URLs to the tool files
+  tool/
+    cinit        cloud-init tool, available at /cinit
+    sudo         sudo tool, available at /sudo
 src/index.js     404 fallback
 wrangler.toml    Worker static-assets configuration
 ```
